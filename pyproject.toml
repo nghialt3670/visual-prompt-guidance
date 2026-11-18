@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visual-prompt-guidance"
+version = "0.2.0"
+description = "Composable spatial-attention guidance for generative models"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["generative-models", "diffusion", "guidance", "visual-prompts", "attention"]
+dependencies = ["torch>=2.6", "numpy>=1.26", "pillow>=10"]
+
+[project.optional-dependencies]
+flux2 = ["diffusers>=0.43,<0.44", "transformers>=4.57", "accelerate>=1.5"]
+ui = ["gradio>=6,<7", "matplotlib>=3.9"]
+dev = ["pytest>=8"]
+all = ["diffusers>=0.43,<0.44", "transformers>=4.57", "accelerate>=1.5", "gradio>=6,<7", "matplotlib>=3.9", "pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
