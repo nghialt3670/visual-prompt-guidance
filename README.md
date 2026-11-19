@@ -1,4 +1,4 @@
-# Visual Prompt Guidance 0.2.0
+# Visual Prompt Guidance 0.3.0
 
 A **small composable framework** for training-free, latent-gradient guidance using spatial attention. A complete rewrite of the public API: the framework is not a FLUX.2 application disguised as a library.
 
@@ -130,3 +130,73 @@ No model loader, UI, or implicit preset runs when importing the package.
 - Head weighting changes the **guidance objective**, not the generator's native attention operation.
 - The target edit mask is prepared once. Subsequent target transforms modify guidance targets; they do not change the backend's native inpaint mask mid-run.
 - Head map exports can consume considerable space and memory; set `maps=False` when not needed.
+
+## InstructPix2Pix backend (0.3.0)
+
+`InstructPix2Pix` is now a second implementation of `ModelAdapter`, using the
+lightweight Stable Diffusion U-Net rather than FLUX.2. It uses the public
+`Engine`, loss functions, head policies, prompts, observers and propagation
+without changes to any core interfaces.
+
+Install only the InstructPix2Pix + UI extras:
+
+```bash
+uv sync --extra pix2pix --extra ui
+uv run --extra pix2pix --extra ui python examples/gradio_app.py --host 0.0.0.0 --port 7861
+```
+
+Select **InstructPix2Pix** in the `Model backend` dropdown. Upload your image,
+mark a point/box/scribble, enter an editing *instruction* (e.g. "Make the bird
+blue") and set **Target object phrase** to a substring of that instruction
+(`bird`). The source image is supplied as the model's image conditioning; the
+visual prompt **only guides attention** and is not composited onto the input.
+
+A runnable Python example:
+
+```bash
+uv run --extra pix2pix python examples/instruct_pix2pix.py input.png \
+  --prompt 'Make the bird blue' --object bird --point 128,100 \
+  --max-side 256 --steps 20 --guide-steps 8
+```
+
+Public API:
+
+```python
+from visual_prompt_guidance.backends import InstructPix2Pix
+from visual_prompt_guidance import Engine, Guidance, Request, Point, Loss, Objective, losses
+
+backend = InstructPix2Pix(device="auto", dtype="auto")
+engine = Engine(backend, Objective(Loss("coverage", losses.coverage)),
+                guidance=Guidance(strength=0.01, max_steps=8))
+result = engine.run(
+    Request({"image": input_image, "prompt": "Make the bird blue", "object_phrase": "bird"},
+            options={"steps": 20, "max_side": 256, "seed": 42,
+                     "cfg": 7.5, "image_cfg": 1.5}),
+    Point(128, 100, sigma=16),
+)
+result.output.save("result.png")
+```
+
+- `cfg`: InstructPix2Pix text guidance scale; default 7.5.
+- `image_cfg`: InstructPix2Pix source-image guidance scale; default 1.5.
+- `max_side`: Longest input side at inference. The U-Net implementation rounds
+  dimensions to multiples of 32, then resizes the output to the input size.
+- `Guidance(layers=...)`: Leave unset for the adapter's small automatic U-Net
+  selection, or choose full module names discovered via
+  `backend.attention_layers()`. Manual head IDs have the form
+  `down_blocks.1.attentions.0.transformer_blocks.0.attn2:H00`.
+- `AffineGrow` works using U-Net self-attention from sibling `attn1` modules.
+  If a selected affinity layer's spatial grid does not match the target grid,
+  choose another U-Net layer or disable the transform.
+- InstructPix2Pix does **not** perform native masked inpainting. It is
+  instruction-based image-to-image editing, with separate text and image CFG.
+  The FLUX.2 `base` and `inpaint` options are not applicable.
+- Head selection/weighting changes the **guidance loss**, not native U-Net
+  inference attention.
+- Inference with gradients uses more memory than ordinary InstructPix2Pix.
+  Try 256px and 1-2 heads initially on a modest GPU or M-series Mac.
+
+Validation: 7 new offline adapter/hook integration tests and 9 existing
+framework tests pass. Full `timbrooks/instruct-pix2pix` checkpoint inference
+has not been executed in the build environment; exact runtime compatibility
+and image quality still require GPU/MPS validation.

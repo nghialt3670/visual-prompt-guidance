@@ -1,3 +1,5 @@
-"""Optional model integrations. Importing the package does not load model weights."""
+"""Optional model adapters. Importing does not load model weights."""
 from .flux2 import Flux2Klein
-__all__ = ["Flux2Klein"]
+from .instruct_pix2pix import InstructPix2Pix
+
+__all__ = ["Flux2Klein", "InstructPix2Pix"]

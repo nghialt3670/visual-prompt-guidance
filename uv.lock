@@ -2755,7 +2755,7 @@ wheels = [
 
 [[package]]
 name = "visual-prompt-guidance"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -2781,6 +2781,11 @@ flux2 = [
     { name = "diffusers" },
     { name = "transformers" },
 ]
+pix2pix = [
+    { name = "accelerate" },
+    { name = "diffusers" },
+    { name = "transformers" },
+]
 ui = [
     { name = "gradio" },
     { name = "matplotlib" },
@@ -2790,8 +2795,10 @@ ui = [
 requires-dist = [
     { name = "accelerate", marker = "extra == 'all'", specifier = ">=1.5" },
     { name = "accelerate", marker = "extra == 'flux2'", specifier = ">=1.5" },
+    { name = "accelerate", marker = "extra == 'pix2pix'", specifier = ">=1.5" },
     { name = "diffusers", marker = "extra == 'all'", specifier = ">=0.43,<0.44" },
     { name = "diffusers", marker = "extra == 'flux2'", specifier = ">=0.43,<0.44" },
+    { name = "diffusers", marker = "extra == 'pix2pix'", specifier = ">=0.43,<0.44" },
     { name = "gradio", marker = "extra == 'all'", specifier = ">=6,<7" },
     { name = "gradio", marker = "extra == 'ui'", specifier = ">=6,<7" },
     { name = "matplotlib", marker = "extra == 'all'", specifier = ">=3.9" },
@@ -2803,8 +2810,9 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6" },
     { name = "transformers", marker = "extra == 'all'", specifier = ">=4.57" },
     { name = "transformers", marker = "extra == 'flux2'", specifier = ">=4.57" },
+    { name = "transformers", marker = "extra == 'pix2pix'", specifier = ">=4.57" },
 ]
-provides-extras = ["flux2", "ui", "dev", "all"]
+provides-extras = ["flux2", "pix2pix", "ui", "dev", "all"]
 
 [[package]]
 name = "zipp"

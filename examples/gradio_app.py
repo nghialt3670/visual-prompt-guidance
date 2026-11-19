@@ -16,12 +16,16 @@ from visual_prompt_guidance import (
     Engine, Request, Guidance, Point, Box, Scribble,
     Objective, Loss, Uniform, Manual, Adaptive, AffinityGrow, FileObserver, losses,
 )
-from visual_prompt_guidance.backends import Flux2Klein
+from visual_prompt_guidance.backends import Flux2Klein, InstructPix2Pix
 
 
-@lru_cache(maxsize=1)
-def backend():
-    return Flux2Klein()
+@lru_cache(maxsize=2)
+def backend(model: str):
+    if model == "InstructPix2Pix":
+        return InstructPix2Pix()
+    if model == "FLUX.2 Klein":
+        return Flux2Klein()
+    raise ValueError(f"Unknown model: {model}")
 
 
 def get_source(editor):
@@ -62,7 +66,8 @@ def extract_scribble(editor, size):
 
 
 def run(editor, selected, kind, prompt, object_name, selected_losses,
-        weights_json, mode, inpaint_strength, steps, guide_steps, strength, seed,
+        weights_json, model, mode, inpaint_strength, steps, guide_steps, strength, seed,
+        text_cfg, image_cfg, max_side,
         head_mode, head_layers, manual_weights, temperature, propagate, save_maps):
     try:
         original = get_source(editor)
@@ -93,11 +98,17 @@ def run(editor, selected, kind, prompt, object_name, selected_losses,
         folder=Path("outputs") / time.strftime("%Y%m%d_%H%M%S")
         observer=FileObserver(folder,maps=save_maps,images=save_maps,interval=3)
         transform=AffinityGrow(start=3,stop=int(guide_steps),limit=12,threshold=.2) if propagate else None
-        runner=Engine(backend(),objective,guidance=cfg,policy=policy,
+        model_backend = backend(model)
+        runner=Engine(model_backend,objective,guidance=cfg,policy=policy,
                       transform=transform,observers=[observer])
+        options={"steps":int(steps), "seed":int(seed), "cfg":float(text_cfg),
+                 "max_side":int(max_side)}
+        if model == "FLUX.2 Klein":
+            options.update(mode=mode,inpaint_strength=float(inpaint_strength))
+        else:
+            options["image_cfg"] = float(image_cfg)
         req=Request(data={"image":original,"prompt":prompt,"object_phrase":object_name},
-                    options={"mode":mode,"inpaint_strength":float(inpaint_strength),
-                             "steps":int(steps),"seed":int(seed),"cfg":4.,"max_side":512})
+                    options=options)
         result=runner.run(req,visual)
         result.output.save(folder/"result.png")
         return result.output, f"Saved {folder} | {len(result.events)} steps"
@@ -121,17 +132,30 @@ def build_demo():
                 object_name=gr.Textbox(label="Target object phrase",value="snake")
                 losses_choice=gr.CheckboxGroup(list(losses.BUILTIN_LOSSES),value=["coverage"],label="Losses")
                 weights=gr.Textbox(label="Loss weights (JSON; omit for 1.0)",value="{}")
-                with gr.Accordion("Sampling",open=False):
-                    mode=gr.Dropdown(["base","inpaint"],value="base",label="Klein mode")
-                    inpaint_strength=gr.Slider(.1,1.,value=.8,step=.05,label="Inpaint strength")
-                    steps=gr.Slider(4,60,value=30,step=1,label="Steps")
-                    guided=gr.Slider(0,30,value=10,step=1,label="Guided steps")
-                    strength=gr.Slider(0,.1,value=.01,step=.001,label="Guidance strength")
+                model=gr.Dropdown(["InstructPix2Pix","FLUX.2 Klein"],value="InstructPix2Pix",
+                                  label="Model backend",info="The UI uses the selected backend; model weights download at first run.")
+                with gr.Accordion("Sampling",open=True):
+                    mode=gr.Dropdown(["base","inpaint"],value="base",label="Klein mode",
+                                     info="FLUX.2 only. InstructPix2Pix is image editing without an inpaint mask.")
+                    inpaint_strength=gr.Slider(.1,1.,value=.8,step=.05,label="Klein inpaint strength",
+                                                info="FLUX.2 inpaint only.")
+                    steps=gr.Slider(4,60,value=30,step=1,label="Denoising steps")
+                    guided=gr.Slider(0,30,value=10,step=1,label="Guided steps",
+                                     info="Number of early steps receiving attention-gradient guidance.")
+                    strength=gr.Slider(0,.1,value=.01,step=.001,label="Latent guidance strength")
                     seed=gr.Number(value=42,precision=0,label="Seed")
+                    text_cfg=gr.Slider(1,12,value=7.5,step=.5,label="Text guidance scale",
+                                       info="InstructPix2Pix default 7.5; FLUX.2 often uses 4. Higher favors the text instruction.")
+                    image_cfg=gr.Slider(1,3,value=1.5,step=.1,label="Image guidance scale (InstructPix2Pix)",
+                                        info="Higher stays closer to the input image; used only by InstructPix2Pix.")
+                    max_side=gr.Slider(128,768,value=256,step=64,label="Maximum image side (px)",
+                                       info="Try 256px locally with gradients. 512px needs more memory.")
                 with gr.Accordion("Head policy / diagnostics",open=False):
                     head_mode=gr.Dropdown(["Uniform","Adaptive","Manual"],value="Uniform",label="Head policy")
-                    head_layers=gr.Textbox(value="D0,D1,D2,D3,D4",label="Model-specific attention layers")
-                    manual=gr.Textbox(value='{"D2:H03":1.0}',label="Manual head weights (JSON)")
+                    head_layers=gr.Textbox(value="",label="Attention layers (optional)",
+                                           info="Leave blank to use the selected backend's default layers. Pix2Pix IDs are U-Net module paths.")
+                    manual=gr.Textbox(value='{}',label="Manual head weights (JSON)",
+                                      info="Use exact labels exported in heads.csv, e.g. {\"down_blocks.1.attentions.0.transformer_blocks.0.attn2:H00\":1}.")
                     temperature=gr.Number(value=.01,label="Adaptive temperature")
                     propagate=gr.Checkbox(value=False,label="Grow target using image affinity")
                     save_maps=gr.Checkbox(value=False,label="Export individual head maps / PNGs")
@@ -142,9 +166,10 @@ def build_demo():
         editor.change(on_editor_change,[editor],[preview,clicks])
         preview.select(on_click,[editor,clicks],[clicks,preview])
         clear.click(lambda ed: ([],get_source(ed)),[editor],[clicks,preview])
-        submit.click(run,[editor,clicks,kind,prompt,object_name,losses_choice,weights,mode,
-                          inpaint_strength,steps,guided,strength,seed,head_mode,head_layers,
-                          manual,temperature,propagate,save_maps],[output,status],concurrency_limit=1)
+        submit.click(run,[editor,clicks,kind,prompt,object_name,losses_choice,weights,model,mode,
+                          inpaint_strength,steps,guided,strength,seed,text_cfg,image_cfg,max_side,
+                          head_mode,head_layers,manual,temperature,propagate,save_maps],
+                     [output,status],concurrency_limit=1)
     return demo
 
 
