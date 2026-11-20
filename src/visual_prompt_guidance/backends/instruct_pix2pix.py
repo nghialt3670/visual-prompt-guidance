@@ -63,12 +63,7 @@ class InstructPix2Pix:
         dtype = ((torch.float16 if device != "cpu" else torch.float32)
                  if self.dtype == "auto" else
                  {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[self.dtype])
-        pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-            self.model_id,
-            variant="fp16",
-            use_safetensors=True,
-            dtype=dtype,
-        )
+        pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(self.model_id, torch_dtype=dtype)
         if self.cpu_offload:
             if device != "cuda":
                 raise ValueError("CPU offload currently requires CUDA")
