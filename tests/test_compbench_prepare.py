@@ -117,6 +117,25 @@ def test_end_to_end_mock_compbench_conversion(tmp_path):
             projected = ex.visual.project(__import__("visual_prompt_guidance").Space((96, 96), (6, 6)))
             assert projected.density.sum() > 0
     for task in args.tasks:
+        for visual in ("point", "box", "scribble"):
+            with EditingDataset(args.out / task / f"manifest_{visual}.json") as by_prompt:
+                assert len(by_prompt) == 2
+                assert all(by_prompt[i].visual.__class__.__name__.lower() == visual for i in range(len(by_prompt)))
         with EditingDataset(args.out / task) as ds:
             assert len(ds) == 6
         assert len(list((args.out / task / "previews").glob("*.png"))) == 2
+
+
+def test_split_only_regenerates_from_existing_data_without_network(tmp_path):
+    args = SimpleNamespace(out=tmp_path / "data", tasks=["add"], per_task=1,
+                           visuals=("point", "box", "scribble"), seed=42,
+                           scribble_points=20, scribble_width=6,
+                           min_mask_pixels=16, max_mask_fraction=.85,
+                           max_attempt_factor=3, prompt_override=None)
+    comp.prepare(args, session=FakeSession())
+    (args.out / "add/manifest_scribble.json").unlink()
+    counts = comp.write_visual_manifests(args.out, ["add"], ["scribble"])
+    assert counts["add/scribble"] == 1
+    from visual_prompt_guidance.training import EditingDataset
+    with EditingDataset(args.out / "add/manifest_scribble.json") as ds:
+        assert len(ds) == 1

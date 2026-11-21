@@ -299,12 +299,52 @@ def export_sample(session: requests.Session, row: dict, task: str, row_idx: int,
     return data
 
 
+def write_visual_manifests(root: Path, tasks: tuple[str, ...] | list[str],
+                           visuals: tuple[str, ...] | list[str]) -> dict[str, int]:
+    """Materialize prompt-specific manifests without duplicating images or downloading.
+
+    All manifest image paths remain relative to their manifest directory,
+    matching EditingDataset's path traversal checks.
+    """
+    counts = {}
+    combined = []
+    for task in tasks:
+        task_dir = root / task
+        source_path = task_dir / "manifest.json"
+        source = json.loads(source_path.read_text(encoding="utf-8"))["samples"]
+        for visual in visuals:
+            selected = [row for row in source if row["visual"]["type"] == visual]
+            if not selected:
+                continue
+            output = task_dir / f"manifest_{visual}.json"
+            output.write_text(json.dumps({"samples": selected}, indent=2) + "\n", encoding="utf-8")
+            counts[f"{task}/{visual}"] = len(selected)
+        for row in source:
+            copy = dict(row)
+            for key in ("input_image", "target_image", "edit_mask"):
+                copy[key] = f"{task}/{copy[key]}"
+            copy["metadata"] = dict(copy.get("metadata", {}))
+            if copy["metadata"].get("region_mask"):
+                copy["metadata"]["region_mask"] = f"{task}/{copy['metadata']['region_mask']}"
+            # If a scribble mask (not path) is used, root paths must also change.
+            if copy["visual"].get("mask"):
+                copy["visual"] = {**copy["visual"], "mask": f"{task}/{copy['visual']['mask']}"}
+            combined.append(copy)
+    (root / "manifest.json").write_text(json.dumps({"samples": combined}, indent=2) + "\n", encoding="utf-8")
+    for visual in visuals:
+        selection = [row for row in combined if row["visual"]["type"] == visual]
+        if selection:
+            (root / f"manifest_{visual}.json").write_text(
+                json.dumps({"samples": selection}, indent=2) + "\n", encoding="utf-8")
+            counts[f"all/{visual}"] = len(selection)
+    return counts
+
+
 def prepare(args: argparse.Namespace, session: requests.Session | None = None) -> dict[str, Any]:
     session = session or session_with_retries()
     root = Path(args.out)
     root.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.seed)
-    combined: list[dict[str, Any]] = []
     report: dict[str, Any] = {"source": REPO, "seed": args.seed, "tasks": {}, "skipped": []}
 
     for task in args.tasks:
@@ -343,24 +383,20 @@ def prepare(args: argparse.Namespace, session: requests.Session | None = None) -
         report["tasks"][task] = {"total_available": count,
                                   "source_pairs_exported": len(samples) // len(args.visuals),
                                   "training_entries": len(samples)}
-        for row in samples:
-            copy = dict(row)
-            for field in ("input_image", "target_image", "edit_mask"):
-                copy[field] = f"{task}/{copy[field]}"
-            copy["metadata"] = dict(copy["metadata"])
-            copy["metadata"]["region_mask"] = f"{task}/{copy['metadata']['region_mask']}"
-            combined.append(copy)
         if len(samples) < args.per_task * len(args.visuals):
             print(f"Warning: {task} exported only {len(samples)//len(args.visuals)} / {args.per_task} requested pairs", file=sys.stderr)
-    (root / "manifest.json").write_text(json.dumps({"samples": combined}, indent=2) + "\n")
+    report["manifests"] = write_visual_manifests(root, args.tasks, args.visuals)
     (root / "download_report.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(f"Done: {len(combined)} training entries → {root}")
+    print(f"Done: {sum(r['training_entries'] for r in report['tasks'].values())} training entries → {root}")
+    print("Generated per-task/per-prompt manifests:", report["manifests"])
     return report
 
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--out", type=Path, default=Path("data/compbench-vpg"))
+    parser.add_argument("--split-only", action="store_true",
+                        help="Regenerate prompt-specific manifests from previously downloaded data")
     parser.add_argument("--per-task", type=int, default=5, help="Unique source/GT image pairs per task")
     parser.add_argument("--tasks", nargs="+", choices=TASKS, default=list(TASKS))
     parser.add_argument("--visuals", nargs="+", choices=VISUALS, default=list(VISUALS))
@@ -383,7 +419,14 @@ def main():
         parser.error("per-task, scribble-points and scribble-width must be positive")
     if args.max_attempt_factor < 1 or args.min_mask_pixels < 1 or not 0 < args.max_mask_fraction <= 1:
         parser.error("Invalid sampling/mask settings")
-    prepare(args)
+    if args.split_only:
+        root = Path(args.out)
+        tasks = [task for task in args.tasks if (root / task / "manifest.json").is_file()]
+        if not tasks:
+            parser.error("No task manifests found under --out")
+        print("Created manifests:", json.dumps(write_visual_manifests(root, tasks, args.visuals), indent=2))
+    else:
+        prepare(args)
 
 
 if __name__ == "__main__":

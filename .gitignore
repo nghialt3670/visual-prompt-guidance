@@ -6,6 +6,7 @@ dist/
 *.egg-info/
 outputs/
 *.pyc
+configs/project.json.*.tmp
 configs/ui_settings.json
 configs/ui_settings.json.*.tmp
 data/

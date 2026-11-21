@@ -11,6 +11,9 @@ from pathlib import Path
 
 from ui_settings import (config_path, read_store, save_profile,
                          normalize_component_value, values_for_profile)
+from visual_prompt_guidance.config import DEFAULT_SETTINGS, resolve_settings, profile_settings
+from visual_prompt_guidance.runtime import (build_backend, build_engine, model_options,
+                                            train_config, parse_manual_weights as shared_manual_weights)
 from typing import Any
 
 import gradio as gr
@@ -18,46 +21,19 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from visual_prompt_guidance import (
-    Engine, Request, Guidance, Point, Box, Scribble,
-    Objective, Loss, Uniform, Manual, Adaptive, Learned, HeadSubset,
-    HeadTrainer, TrainConfig, ImageLossConfig,
-    AffinityGrow, FileObserver, losses,
+    Request, Point, Box, Scribble, HeadTrainer, FileObserver, losses,
 )
-from visual_prompt_guidance.backends import Flux2Klein, InstructPix2Pix
 from visual_prompt_guidance.experiments import create_run_dir, save_run_config, save_training_reports
 
 CANVAS_HEIGHT = 520
-BUILTIN_WEIGHT_DEFAULTS = {
-    "coverage": 1.0,
-    "focal": 1.0,
-    "moment": 1.0,
-    "centerline": 1.0,
-    "centroid": 1.0,
-    "outside": 1.0,
-}
-
-
 # The host app owns its serializable settings; none of these are engine defaults.
 # Both presets are full snapshots, so Generate and Train can use different
 # sampling, heads, losses and propagation without overwriting one another.
-SETTING_DEFAULTS = {
-    "tool": "Scribble", "prompt": "Insert a dog", "object_name": "dog", "model": "InstructPix2Pix",
-    "selected_losses": ["coverage"],
-    "coverage_w": 1.0, "focal_w": 1.0, "moment_w": 1.0,
-    "centerline_w": 1.0, "centroid_w": 1.0, "outside_w": 1.0,
-    "steps": 30, "guide_steps": 10, "strength": 0.01, "seed": 42, "max_side": 256,
-    "flux_mode": "base", "flux_inpaint_strength": 0.8, "flux_cfg": 4.0,
-    "pix_text_cfg": 7.5, "pix_image_cfg": 1.5,
-    "head_mode": "Uniform", "selected_layers": [], "selected_heads": [], "manual_rows": [],
-    "adaptive_temperature": 0.01, "adaptive_ema": 0.5, "adaptive_mix": 0.1,
-    "learned_checkpoint": "", "dataset_path": "", "learned_temperature": 1.0,
-    "training_epochs": 1, "learning_rate": 0.001, "optimizer_name": "adamw", "weight_decay": 0.0,
-    "image_loss_name": "l1", "inside_weight": 1.0, "outside_weight": 1.0,
-    "lpips_weight": 0.0, "grad_clip": 1.0,
-    "use_propagation": False, "propagation_layers": [], "propagation_start": 3,
-    "propagation_stop": 10, "propagation_limit": 12, "propagation_threshold": 0.2,
-    "propagation_max_fraction": 0.3, "save_maps": False,
-}
+# UI controls are a view over the shared schema, not a second config source.
+# Device/dtype/model-id may be edited directly in configs/project.json or by CLI.
+SETTING_DEFAULTS = {key: value for key, value in DEFAULT_SETTINGS.items()
+                    if key not in {"device", "dtype", "model_id"}}
+
 
 
 def save_ui_profile(profile: str, keys: list[str], *values):
@@ -89,12 +65,15 @@ def restore_ui_profile(profile: str, keys: list[str]):
 
 
 @lru_cache(maxsize=4)
-def backend(model: str):
-    if model == "InstructPix2Pix":
-        return InstructPix2Pix()
-    if model == "FLUX.2 Klein":
-        return Flux2Klein()
-    raise ValueError(f"Unknown model: {model}")
+def backend(model: str, device: str = "auto", dtype: str = "auto", model_id: str | None = None):
+    return build_backend({"model": model, "device": device, "dtype": dtype, "model_id": model_id})
+
+
+def backend_from_settings(settings):
+    # Reuse loaded models between runs; preserve one-arg backend injection for test hosts.
+    if settings["device"] == "auto" and settings["dtype"] == "auto" and not settings["model_id"]:
+        return backend(settings["model"])
+    return backend(settings["model"], settings["device"], settings["dtype"], settings["model_id"])
 
 
 def _to_pil_rgb(value: Any) -> Image.Image:
@@ -224,21 +203,6 @@ def visual_prompt_from_canvas(editor, tool, points):
     return Scribble(mask=extract_scribble_mask(editor, background.size))
 
 
-def collect_loss_terms(selected_losses, coverage_w, focal_w, moment_w, centerline_w, centroid_w, outside_w):
-    weight_values = {
-        "coverage": float(coverage_w),
-        "focal": float(focal_w),
-        "moment": float(moment_w),
-        "centerline": float(centerline_w),
-        "centroid": float(centroid_w),
-        "outside": float(outside_w),
-    }
-    terms = [Loss(name, losses.BUILTIN_LOSSES[name], weight_values[name]) for name in (selected_losses or [])]
-    if not terms:
-        raise ValueError("Select at least one loss.")
-    return Objective(*terms)
-
-
 def update_model_panels(model):
     return (
         gr.update(visible=model == "FLUX.2 Klein"),
@@ -350,26 +314,34 @@ def update_head_mode(mode):
 
 
 def parse_manual_weights(rows):
-    if rows is None:
-        return {}
-    if hasattr(rows, "values"):
-        rows = rows.values.tolist()
-    elif hasattr(rows, "tolist") and not isinstance(rows, list):
-        rows = rows.tolist()
-    if not rows:
-        return {}
-    parsed = {}
-    for row in rows:
-        if not row or len(row) < 2:
-            continue
-        label = str(row[0]).strip()
-        if not label:
-            continue
-        weight = float(row[1])
-        if weight < 0:
-            raise ValueError(f"Weight for {label} must be nonnegative")
-        parsed[label] = weight
-    return parsed
+    return shared_manual_weights(rows)
+
+
+def app_overrides(*, model, selected_losses, coverage_w, focal_w, moment_w,
+                  centerline_w, centroid_w, outside_w, steps, guide_steps, strength,
+                  seed, max_side, flux_mode, flux_inpaint_strength, flux_cfg,
+                  pix_text_cfg, pix_image_cfg, selected_layers, selected_heads,
+                  use_propagation, propagation_layers, propagation_start,
+                  propagation_stop, propagation_limit, propagation_threshold,
+                  propagation_max_fraction, **extras):
+    """UI values are applied to the same schema resolved by the CLI."""
+    config = {
+        "model": model, "selected_losses": selected_losses,
+        "coverage_w": coverage_w, "focal_w": focal_w, "moment_w": moment_w,
+        "centerline_w": centerline_w, "centroid_w": centroid_w, "outside_w": outside_w,
+        "steps": steps, "guide_steps": guide_steps, "strength": strength,
+        "seed": seed, "max_side": max_side,
+        "flux_mode": flux_mode, "flux_inpaint_strength": flux_inpaint_strength,
+        "flux_cfg": flux_cfg, "pix_text_cfg": pix_text_cfg, "pix_image_cfg": pix_image_cfg,
+        "selected_layers": selected_layers or [], "selected_heads": selected_heads or [],
+        "use_propagation": use_propagation,
+        "propagation_layers": propagation_layers or [], "propagation_start": propagation_start,
+        "propagation_stop": propagation_stop, "propagation_limit": propagation_limit,
+        "propagation_threshold": propagation_threshold,
+        "propagation_max_fraction": propagation_max_fraction,
+    }
+    config.update(extras)
+    return {key: normalize_component_value(value) for key, value in config.items()}
 
 
 def run(editor, selected_points, tool, prompt, object_name,
@@ -385,74 +357,38 @@ def run(editor, selected_points, tool, prompt, object_name,
     try:
         original, _ = parse_editor(editor)
         visual = visual_prompt_from_canvas(editor, tool, selected_points or [])
-        objective = collect_loss_terms(selected_losses, coverage_w, focal_w, moment_w, centerline_w, centroid_w, outside_w)
-
-        if head_mode == "Adaptive":
-            policy = Adaptive(temperature=float(adaptive_temperature), ema=float(adaptive_ema), mix=float(adaptive_mix))
-        elif head_mode == "Manual":
-            policy = Manual(parse_manual_weights(manual_rows))
-        elif head_mode == "Learned":
-            if not learned_checkpoint or not Path(learned_checkpoint).is_file():
-                raise ValueError("Train head weights first, or specify a valid learned-head checkpoint")
-            policy = Learned.load(learned_checkpoint)
-            expected_selection = set(policy.selected or policy.labels)
-            if selected_heads and set(selected_heads) != expected_selection:
-                raise ValueError("Head selection differs from the learned checkpoint; select matching heads or clear the checkbox selection")
-        else:
-            policy = Uniform()
-        if selected_heads and head_mode in ("Adaptive", "Uniform"):
-            policy = HeadSubset(policy, tuple(selected_heads))
-
-        guidance = Guidance(
-            strength=float(strength),
-            max_steps=int(guide_steps),
-            layers=tuple(selected_layers or []) or None,
-            affinity_layers=tuple(propagation_layers or []) or None,
+        overrides = app_overrides(
+            model=model, selected_losses=selected_losses,
+            coverage_w=coverage_w, focal_w=focal_w, moment_w=moment_w,
+            centerline_w=centerline_w, centroid_w=centroid_w, outside_w=outside_w,
+            steps=steps, guide_steps=guide_steps, strength=strength,
+            seed=seed, max_side=max_side,
+            flux_mode=flux_mode, flux_inpaint_strength=flux_inpaint_strength,
+            flux_cfg=flux_cfg, pix_text_cfg=pix_text_cfg, pix_image_cfg=pix_image_cfg,
+            selected_layers=selected_layers, selected_heads=selected_heads,
+            use_propagation=use_propagation, propagation_layers=propagation_layers,
+            propagation_start=propagation_start, propagation_stop=propagation_stop,
+            propagation_limit=propagation_limit,
+            propagation_threshold=propagation_threshold,
+            propagation_max_fraction=propagation_max_fraction,
+            head_mode=head_mode, manual_rows=normalize_component_value(manual_rows) if manual_rows is not None else [],
+            adaptive_temperature=adaptive_temperature, adaptive_ema=adaptive_ema,
+            adaptive_mix=adaptive_mix, learned_checkpoint=learned_checkpoint or "",
+            save_maps=save_maps, prompt=prompt, object_name=object_name, tool=tool,
         )
-        transform = None
-        if use_propagation:
-            transform = AffinityGrow(
-                start=int(propagation_start),
-                stop=int(propagation_stop),
-                limit=int(propagation_limit),
-                threshold=float(propagation_threshold),
-                max_fraction=float(propagation_max_fraction),
-            )
-
+        settings = resolve_settings("generate", overrides)
         folder = create_run_dir("generate")
         observer = FileObserver(folder, maps=save_maps, images=save_maps, interval=3)
-        model_backend = backend(model)
-        runner = Engine(model_backend, objective, guidance=guidance, policy=policy, transform=transform, observers=[observer])
-
-        options = {
-            "steps": int(steps),
-            "seed": int(seed),
-            "max_side": int(max_side),
-        }
-        if model == "FLUX.2 Klein":
-            options.update(mode=flux_mode, inpaint_strength=float(flux_inpaint_strength), cfg=float(flux_cfg))
-        else:
-            options.update(cfg=float(pix_text_cfg), image_cfg=float(pix_image_cfg), mode="base")
-
+        runner = build_engine(settings, backend=backend_from_settings(settings), observers=[observer])
+        options = model_options(settings)
         request = Request(
             data={"image": original, "prompt": prompt, "object_phrase": object_name},
             options=options,
         )
-        save_run_config(folder, {
-            "workflow": "generate", "model": model, "prompt": prompt, "object_phrase": object_name,
-            "visual_tool": tool, "points": selected_points or [],
-            "losses": [{"name": loss.name, "weight": loss.weight} for loss in objective.terms],
-            "guidance": vars(guidance), "head_mode": head_mode,
-            "selected_heads": selected_heads or [],
-            "manual_weights": parse_manual_weights(manual_rows) if head_mode == "Manual" else None,
-            "adaptive": {"temperature": adaptive_temperature, "ema": adaptive_ema, "mix": adaptive_mix},
-            "learned_checkpoint": learned_checkpoint if head_mode == "Learned" else None,
-            "propagation": ({"enabled": True, "start": propagation_start, "stop": propagation_stop,
-                             "limit": propagation_limit, "threshold": propagation_threshold,
-                             "max_fraction": propagation_max_fraction} if use_propagation else {"enabled": False}),
-            "model_options": options, "save_maps": bool(save_maps),
-            "source_size": list(original.size),
-        })
+        save_run_config(folder, {"workflow": "generate", "source": "ui",
+                                 "config_source": str(config_path()), "settings": settings,
+                                 "visual_tool": tool, "points": selected_points or [],
+                                 "model_options": options, "source_size": list(original.size)})
         original.save(folder / "input.png")
         if tool == "Scribble":
             extract_scribble_mask(editor, original.size).save(folder / "visual_prompt.png")
@@ -478,67 +414,53 @@ def train_heads(dataset_file, dataset_path, model, selected_losses,
         location = str(dataset_file or dataset_path or "").strip()
         if not location:
             raise ValueError("Provide a dataset ZIP or a server-side manifest.json / directory")
-        objective = collect_loss_terms(selected_losses, coverage_w, focal_w, moment_w,
-                                       centerline_w, centroid_w, outside_w)
-        policy = Learned(
-            selected=tuple(selected_heads) if selected_heads else None,
-            temperature=float(learned_temperature),
+        overrides = app_overrides(
+            model=model, selected_losses=selected_losses,
+            coverage_w=coverage_w, focal_w=focal_w, moment_w=moment_w,
+            centerline_w=centerline_w, centroid_w=centroid_w, outside_w=outside_w,
+            steps=steps, guide_steps=guide_steps, strength=strength,
+            seed=seed, max_side=max_side,
+            flux_mode=flux_mode, flux_inpaint_strength=flux_inpaint_strength,
+            flux_cfg=flux_cfg, pix_text_cfg=pix_text_cfg, pix_image_cfg=pix_image_cfg,
+            selected_layers=selected_layers, selected_heads=selected_heads,
+            use_propagation=use_propagation, propagation_layers=propagation_layers,
+            propagation_start=propagation_start, propagation_stop=propagation_stop,
+            propagation_limit=propagation_limit,
+            propagation_threshold=propagation_threshold,
+            propagation_max_fraction=propagation_max_fraction,
+            learned_temperature=learned_temperature, dataset_path=location,
+            training_epochs=epochs, learning_rate=learning_rate, optimizer_name=optimizer_name,
+            weight_decay=weight_decay, image_loss_name=image_loss_name,
+            inside_weight=inside_weight, outside_weight=outside_weight,
+            lpips_weight=lpips_weight, grad_clip=grad_clip,
         )
-        transform = AffinityGrow(
-            start=int(propagation_start), stop=int(propagation_stop),
-            limit=int(propagation_limit), threshold=float(propagation_threshold),
-            max_fraction=float(propagation_max_fraction),
-        ) if use_propagation else None
-        guidance = Guidance(strength=float(strength), max_steps=int(guide_steps),
-                            layers=tuple(selected_layers or []) or None,
-                            affinity_layers=tuple(propagation_layers or []) or None)
+        overrides["head_mode"] = "Learned"
+        settings = resolve_settings("train", overrides)
         folder = create_run_dir("train")
         checkpoint_path = folder / "learned_heads.json"
         history_path = folder / "history.json"
+        cfg, img_loss = train_config(settings, checkpoint_path, history_path)
         trainer = HeadTrainer(
-            Engine(backend(model), objective, policy=policy,
-                   guidance=guidance, transform=transform),
-            config=TrainConfig(
-                epochs=int(epochs), learning_rate=float(learning_rate),
-                optimizer=str(optimizer_name), weight_decay=float(weight_decay), grad_clip=float(grad_clip),
-                checkpoint=str(checkpoint_path),
-                history=str(history_path),
-            ),
-            image_loss=ImageLossConfig(
-                pixel=str(image_loss_name), inside_weight=float(inside_weight),
-                outside_weight=float(outside_weight), lpips_weight=float(lpips_weight),
-            ),
+            build_engine(settings, training=True, backend=backend_from_settings(settings)),
+            config=cfg, image_loss=img_loss,
         )
-        options = {"steps": int(steps), "seed": int(seed), "max_side": int(max_side)}
-        if model == "FLUX.2 Klein":
-            options.update(mode=flux_mode, inpaint_strength=float(flux_inpaint_strength),
-                           cfg=float(flux_cfg))
-        else:
-            options.update(cfg=float(pix_text_cfg), image_cfg=float(pix_image_cfg), mode="base")
-        save_run_config(folder, {
-            "workflow": "train", "model": model, "dataset": location,
-            "losses": [{"name": loss.name, "weight": loss.weight} for loss in objective.terms],
-            "guidance": vars(guidance), "selected_layers": selected_layers or [],
-            "selected_heads": selected_heads or [], "learned_temperature": learned_temperature,
-            "train_config": vars(trainer.config), "image_loss": vars(trainer.criterion.config),
-            "propagation": ({"enabled": True, "start": propagation_start, "stop": propagation_stop,
-                             "limit": propagation_limit, "threshold": propagation_threshold,
-                             "max_fraction": propagation_max_fraction} if use_propagation else {"enabled": False}),
-            "model_options": options,
-        })
+        options = model_options(settings)
+        save_run_config(folder, {"workflow": "train", "source": "ui",
+                                 "config_source": str(config_path()), "settings": settings,
+                                 "dataset": location, "model_options": options,
+                                 "train_config": vars(cfg), "image_loss": vars(img_loss)})
         def on_progress(done, total, event):
             progress((done, total), desc=f"Epoch {event['epoch']} | image loss {event['loss']:.5f}")
         result = trainer.fit(location, options=options, progress=on_progress)
         save_training_reports(folder, result.history, result.head_labels, result.weights)
-        # The auto-saved training preset should remember the new checkpoint.
-        prefs = read_store()
-        save_profile("train", {**prefs["train"], "learned_checkpoint": result.checkpoint})
+        # Store the checkpoint for later explicit reuse in Generate.
+        save_profile("train", {"learned_checkpoint": result.checkpoint})
         weights = sorted(zip(result.head_labels, result.weights), key=lambda x: x[1], reverse=True)
         top = ", ".join(f"{name}: {weight:.3f}" for name, weight in weights[:3])
         return result.checkpoint, (
             f"Training completed: {len(result.history)} examples processed. "
             f"Last image loss: {result.history[-1]['loss']:.5f}. "
-            f"Saved training run: {folder}. Last image loss: {result.history[-1]['loss']:.5f}. "
+            f"Saved training run: {folder}. "
             f"Top heads: {top}"
         )
     except (ValueError, RuntimeError, TypeError, KeyError, ImportError, OSError) as error:
@@ -548,7 +470,7 @@ def train_heads(dataset_file, dataset_path, model, selected_losses,
 def build_demo():
     saved_store = read_store()
     active_profile = saved_store["active"]
-    saved_values = {**SETTING_DEFAULTS, **saved_store[active_profile]}
+    saved_values = profile_settings(active_profile)
     def initial(name):
         return saved_values[name]
     with gr.Blocks(title="Visual Prompt Guidance — Example Application") as demo:
@@ -703,6 +625,7 @@ def build_demo():
         with gr.Accordion("Diagnostics", open=False):
             save_maps = gr.Checkbox(value=initial("save_maps"), label="Save per-head maps / PNGs")
 
+        use_trained_btn = gr.Button("Use trained weights for Generate", variant="secondary")
         submit = gr.Button("Generate", variant="primary")
 
         component_scope = locals().copy()
@@ -754,6 +677,18 @@ def build_demo():
             [learned_checkpoint, train_status], concurrency_limit=1,
         )
 
+        def use_trained_for_generate(checkpoint):
+            if not checkpoint or not Path(checkpoint).is_file():
+                raise gr.Error("Train weights first, or specify a valid learned_heads.json")
+            save_profile("generate", {"head_mode": "Learned", "learned_checkpoint": checkpoint,
+                                      "selected_layers": [], "selected_heads": []})
+            return gr.update(value="Learned"), gr.update(value=checkpoint), [], [], (
+                f"Generate will use learned weights from `{checkpoint}`. "
+                "Layer selection is taken from the checkpoint."
+            )
+        use_trained_btn.click(use_trained_for_generate, [learned_checkpoint],
+                              [head_mode, learned_checkpoint, selected_layers, selected_heads, preset_status])
+
         submit.click(
             lambda *args: save_ui_profile("generate", setting_names, *args),
             setting_values, [preset_status], queue=False,
@@ -777,7 +712,12 @@ def build_demo():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=None,
+                        help="Shared settings path (also used by CLI; default configs/project.json)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7861)
     args = parser.parse_args()
+    if args.config:
+        import os
+        os.environ["VPG_CONFIG"] = args.config
     build_demo().queue().launch(server_name=args.host, server_port=args.port)

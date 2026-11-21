@@ -1,46 +1,37 @@
-"""Run: uv run --extra pix2pix python examples/instruct_pix2pix.py input.png"""
+"""Legacy short command for Pix2Pix; delegates to the shared generate CLI/config."""
+from __future__ import annotations
 import argparse
-from pathlib import Path
-from PIL import Image
-from visual_prompt_guidance import (
-    Engine, Guidance, Request, Point, Box, Scribble,
-    Objective, Loss, Uniform, Adaptive, FileObserver, losses,
-)
-from visual_prompt_guidance.backends import InstructPix2Pix
+from generate import main as generate_main
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("image", help="Source image path")
-    parser.add_argument("--prompt", default="make the bird blue", help="Editing instruction containing the object name")
-    parser.add_argument("--object", default="bird")
-    parser.add_argument("--point", default="128,128", help="Point x,y in SOURCE image pixels")
-    parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--guide-steps", type=int, default=8)
-    parser.add_argument("--max-side", type=int, default=256)
-    parser.add_argument("--adaptive", action="store_true")
-    parser.add_argument("--out", default="outputs/instruct_pix2pix")
-    args = parser.parse_args()
-    x, y = (float(v) for v in args.point.split(","))
-    source = Image.open(args.image).convert("RGB")
-    folder = Path(args.out)
-    folder.mkdir(parents=True, exist_ok=True)
-    model = InstructPix2Pix()  # lazy model load; also supports device='mps', dtype='fp16'
-    engine = Engine(
-        backend=model,
-        objective=Objective(Loss("coverage", losses.coverage)),
-        policy=Adaptive(temperature=.01) if args.adaptive else Uniform(),
-        guidance=Guidance(strength=.01, max_steps=args.guide_steps),
-        observers=[FileObserver(folder, maps=False)],
-    )
-    request = Request(
-        {"image": source, "prompt": args.prompt, "object_phrase": args.object},
-        options={"steps": args.steps, "max_side": args.max_side, "seed": 42,
-                 "cfg": 7.5, "image_cfg": 1.5},
-    )
-    result = engine.run(request, Point(x, y, sigma=16))
-    result.output.save(folder / "result.png")
-    print(f"Saved: {folder / 'result.png'}")
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("image")
+    p.add_argument("--prompt", default=None)
+    p.add_argument("--object", default=None)
+    p.add_argument("--point", default=None, help="x,y in image coordinates")
+    p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--guide-steps", type=int, default=None)
+    p.add_argument("--max-side", type=int, default=None)
+    p.add_argument("--adaptive", action="store_true")
+    p.add_argument("--out", default=None)
+    p.add_argument("--config", default=None)
+    p.add_argument("--checkpoint", default=None)
+    args = p.parse_args(argv)
+    params = ["--backend", "pix2pix", "--image", args.image]
+    if args.point is not None:
+        x, y = args.point.split(",")
+        params += ["--point", x, y]
+    for arg, field in [("--prompt", "prompt"), ("--object", "object"),
+                       ("--steps", "steps"), ("--guided-steps", "guide_steps"),
+                       ("--max-side", "max_side"), ("--output-dir", "out"),
+                       ("--config", "config"), ("--checkpoint", "checkpoint")]:
+        value = getattr(args, field)
+        if value is not None:
+            params += [arg, str(value)]
+    if args.adaptive:
+        params += ["--policy", "Adaptive"]
+    return generate_main(params)
 
 
 if __name__ == "__main__":

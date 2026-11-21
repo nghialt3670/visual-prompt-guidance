@@ -1,6 +1,54 @@
-# Visual Prompt Guidance 0.3.0
+# Visual Prompt Guidance 0.6.0
 
 A **small composable framework** for training-free, latent-gradient guidance using spatial attention. A complete rewrite of the public API: the framework is not a FLUX.2 application disguised as a library.
+
+## Shared CLI / Gradio configuration (v0.6.0)
+
+**One project settings file:** `configs/project.json` (or pass `--config` / set `VPG_CONFIG`).
+All default values live in `src/visual_prompt_guidance/config.py`. CLI, Gradio and Python hosts use the same `resolve_settings` and `runtime.build_engine` functions. The project file contains **two independent profiles**, `generate` and `train`; omitted values use the central defaults. Example: `configs/project.example.json`.
+
+```bash
+# Start UI with the same settings file that scripts read
+uv run --extra ui --extra pix2pix python examples/gradio_app.py --config configs/project.json
+
+# Train using train profile; explicit arguments override it for this run only
+uv run --extra pix2pix python examples/train_heads.py \
+  --dataset data/compbench-vpg/add/manifest_scribble.json \
+  --backend pix2pix --steps 20 --guided-steps 3 --epochs 5
+
+# Persist CLI overrides to train profile for subsequent UI/CLI runs
+uv run --extra pix2pix python examples/train_heads.py \
+  --dataset data/compbench-vpg/add/manifest_scribble.json --steps 20 --save-config
+
+# Generate with saved Generate profile, selecting one dataset example
+uv run --extra pix2pix python examples/generate.py \
+  --dataset data/compbench-vpg/add/manifest_scribble.json --sample-index 0
+
+# Inference with trained head weights; attention layers are auto-restored
+uv run --extra pix2pix python examples/generate.py \
+  --dataset data/compbench-vpg/add/manifest_scribble.json \
+  --checkpoint outputs/train/YOUR_RUN/learned_heads.json
+```
+
+With a standalone source image, use `examples/generate.py --image input.png --prompt "Add a dog" --object dog --point 100 150`, or `--box x0 y0 x1 y1`, `--scribble-mask mask.png`, or `--scribble-path path.json`. The legacy `examples/instruct_pix2pix.py` is now a wrapper around the same Generate CLI.
+
+The Gradio UI has Save/Load per-profile controls and **Use trained weights for Generate** after training. Saved weights are referenced by `learned_checkpoint`; inference loads them with `Learned.load`, restoring the *exact trained attention layer order* and rejecting incompatible explicit selections. To avoid confusing comparisons, match the guidance loss, strengths, and denoising schedule of training when applying weights at inference.
+
+The app will read existing `configs/ui_settings.json` from v0.5.x if the canonical file does not exist, then write `configs/project.json` at the next save. Uploaded images and ZIP bytes are not persisted as profile settings. Run folders still contain the effective `config.json` snapshot.
+
+### CompBench datasets without manual filtering
+
+```bash
+# Using already downloaded CompBench data: no network, no re-download
+uv run --extra dataset python examples/prepare_compbench.py \
+  --split-only --out data/compbench-vpg
+
+# Or download a new random sample and write task/prompt manifests automatically
+uv run --extra dataset python examples/prepare_compbench.py \
+  --per-task 5 --out data/compbench-vpg --seed 42
+```
+
+A task folder (e.g. `data/compbench-vpg/add/`) contains `manifest.json` with all variants and `manifest_point.json`, `manifest_box.json`, and `manifest_scribble.json` with a single visual-prompt type. The root folder also contains these combined-across-task manifests. **Pass the specific manifest path** to training when learning task-specific scribble weights; don't train on the mixed manifest unless intended. Input/edited images, masks, instructions and centerline paths keep the existing `EditingDataset` format. CompBench edit-region masks are not guaranteed clean object silhouettes.
 
 ## Design
 
@@ -14,7 +62,7 @@ Core has **five independent contracts**:
 | `HeadPolicy` | Uniform, manual, adaptive, or custom weights | Opaque head IDs; no assumptions about names |
 | `TargetTransform` | Optional attention-based mask expansion or other transforms | The target + attention |
 
-Observers are optional. The **engine has no prompt names, no loss names, no network block names, no CFG, and no inpaint branches**. Those details are supplied by the host application or model adapter. There is deliberately **no global registration system**: just pass objects. A host application can add its own registry or JSON/Pydantic configuration if it needs serializable settings.
+Observers are optional. The **engine has no prompt names, no loss names, no network block names, no CFG, and no inpaint branches**. Those details are supplied by the host application or model adapter. There is deliberately **no global registration system**: just pass objects. The optional `visual_prompt_guidance.config` and `visual_prompt_guidance.runtime` modules supply shared, versioned JSON configuration and composition for the CLI and Gradio application.
 
 **Scope:** The current engine targets models that expose a *differentiable latent state* and *spatial, head-resolved attention during stepwise sampling*. Other generator families can reuse the prompt/loss layers but may require a different engine contract. An abstraction should not pretend GANs and autoregressive models implement denoising steps.
 
