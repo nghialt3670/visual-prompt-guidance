@@ -8,6 +8,7 @@ Example:
 from __future__ import annotations
 import argparse
 from pathlib import Path
+from visual_prompt_guidance.experiments import create_run_dir, save_run_config, save_training_reports
 
 from visual_prompt_guidance import (
     Engine, Guidance, Learned, Loss, Objective, HeadTrainer, TrainConfig,
@@ -41,7 +42,8 @@ def main():
     parser.add_argument("--outside-weight", type=float, default=1.0)
     parser.add_argument("--lpips-weight", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--output", default="outputs/learned_heads.json")
+    parser.add_argument("--output-dir", default=None, help="Run folder; default outputs/train/<timestamp>")
+    parser.add_argument("--output", default=None, help="Legacy checkpoint path; optional")
     parser.add_argument("--text-cfg", type=float, default=None)
     parser.add_argument("--image-cfg", type=float, default=1.5)
     parser.add_argument("--flux-mode", choices=["base", "inpaint"], default="base")
@@ -57,13 +59,28 @@ def main():
                     guidance=Guidance(strength=args.strength, max_steps=args.guided_steps,
                                       layers=tuple(args.layer) if args.layer else None),
                     policy=policy)
-    output = Path(args.output)
+    if args.output_dir and args.output:
+        parser.error("Choose either --output-dir or --output")
+    if args.output:
+        # Backward compatibility with existing scripts that specify a checkpoint.
+        checkpoint_path = Path(args.output)
+        run_dir = checkpoint_path.parent
+        run_dir.mkdir(parents=True, exist_ok=True)
+    elif args.output_dir:
+        run_dir = Path(args.output_dir)
+        if run_dir.exists() and any(run_dir.iterdir()):
+            parser.error(f"Run folder must be empty: {run_dir}")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = run_dir / "learned_heads.json"
+    else:
+        run_dir = create_run_dir("train")
+        checkpoint_path = run_dir / "learned_heads.json"
     trainer = HeadTrainer(runner,
         config=TrainConfig(epochs=args.epochs, learning_rate=args.lr,
                            optimizer=args.optimizer, weight_decay=args.weight_decay,
                            grad_clip=args.grad_clip,
-                           checkpoint=str(output),
-                           history=str(output.with_suffix(".history.json"))),
+                           checkpoint=str(checkpoint_path),
+                           history=str(run_dir / "history.json")),
         image_loss=ImageLossConfig(pixel=args.loss, inside_weight=args.inside_weight,
                                    outside_weight=args.outside_weight, lpips_weight=args.lpips_weight))
     options = {"steps":args.steps, "max_side":args.max_side, "seed":args.seed,
@@ -72,9 +89,19 @@ def main():
         options.update(image_cfg=args.image_cfg)
     else:
         options.update(mode=args.flux_mode, inpaint_strength=args.inpaint_strength)
+    save_run_config(run_dir, {
+        "workflow": "train", "source": "cli", "model": args.backend,
+        "dataset": args.dataset, "guidance": vars(runner.guidance),
+        "losses": [{"name": args.guidance_loss, "weight": args.guidance_loss_weight}],
+        "selected_heads": args.head, "selected_layers": args.layer,
+        "train_config": vars(trainer.config), "image_loss": vars(trainer.criterion.config),
+        "model_options": options, "dtype": args.dtype, "device": args.device,
+        "learned_temperature": args.temperature,
+    })
     result = trainer.fit(args.dataset, options=options,
         progress=lambda n,total,event: print(f"{n}/{total} image loss={event['loss']:.6f} grad={event['grad_norm']:.5g}",flush=True))
-    print(f"Saved {result.checkpoint} ({len(result.weights)} heads)")
+    save_training_reports(run_dir, result.history, result.head_labels, result.weights)
+    print(f"Saved training run to {run_dir} ({len(result.weights)} heads)")
 
 
 if __name__ == "__main__":

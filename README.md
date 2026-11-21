@@ -319,3 +319,54 @@ sampling. Start with 4 steps, 1 guided step and 128px resolution, and train
 one image per optimizer step. Large FLUX models may still be impractical.
 No real-checkpoint/GPU training run is claimed: the included CPU tests use a
 differentiable mock generator and validate higher-order gradients numerically.
+
+## Persistent Gradio settings and experiment runs (v0.5.0)
+
+The optional Gradio app saves **two independent UI configuration snapshots** in
+`configs/ui_settings.json`: one for **Generate** and one for **Training**.
+Change controls and click **Save Generate settings** or **Save Training settings**;
+or simply click **Generate** / **Train head weights**, which saves that workflow's
+settings first. On restart, the last-saved workflow's controls are restored.
+Use **Load Generate settings** and **Load Training settings** to switch presets.
+Model weights are *not* loaded just to restore settings. The active model's
+previously selected layer/head IDs are retained; use **Load available layers / heads**
+when you want to browse the full catalog (this still loads the model checkpoint).
+Image uploads, canvas drawings, and temporary uploaded dataset ZIP files are not
+stored in the preferences file. Use a persistent `dataset_path` to re-run training
+later. Settings are stored on the server and shared by its UI users, so don't
+use this single-user preference file as multi-user account storage.
+
+Run outputs are kept separate and never intentionally overwrite another run:
+
+```text
+outputs/
+  generate/YYYYMMDD_HHMMSS_microseconds/
+    config.json          # effective generation parameters
+    input.png
+    visual_prompt.png    # only if using a scribble
+    result.png
+    steps.json           # observer output
+    heads.csv            # observer output (when heads were recorded)
+    head_maps/           # only when map export is enabled
+  train/YYYYMMDD_HHMMSS_microseconds/
+    config.json          # model, dataset, objectives and training settings
+    learned_heads.json  # trained weights
+    history.json        # per-sample losses, gradient norm, components
+    head_weights.csv    # weights sorted descending
+    loss_curve.png      # training image loss by iteration
+```
+
+All paths are relative to the working directory from which the app starts.
+Specify `VPG_UI_CONFIG=/path/to/settings.json` to move the saved UI settings.
+
+CLI training also creates a timestamped run by default:
+
+```bash
+uv run --extra pix2pix python examples/train_heads.py \
+  --backend pix2pix --dataset ./my_training_data \
+  --max-side 128 --steps 4 --guided-steps 1 --epochs 1
+```
+
+To use a particular location, specify `--output-dir outputs/train/my_experiment`.
+The legacy `--output checkpoint.json` option is retained for existing scripts;
+it writes the other training artifacts next to the specified checkpoint.

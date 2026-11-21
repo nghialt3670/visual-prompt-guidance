@@ -6,9 +6,11 @@ Run from the project root:
 from __future__ import annotations
 
 import argparse
-import time
 from functools import lru_cache
 from pathlib import Path
+
+from ui_settings import (config_path, read_store, save_profile,
+                         normalize_component_value, values_for_profile)
 from typing import Any
 
 import gradio as gr
@@ -22,6 +24,7 @@ from visual_prompt_guidance import (
     AffinityGrow, FileObserver, losses,
 )
 from visual_prompt_guidance.backends import Flux2Klein, InstructPix2Pix
+from visual_prompt_guidance.experiments import create_run_dir, save_run_config, save_training_reports
 
 CANVAS_HEIGHT = 520
 BUILTIN_WEIGHT_DEFAULTS = {
@@ -32,6 +35,57 @@ BUILTIN_WEIGHT_DEFAULTS = {
     "centroid": 1.0,
     "outside": 1.0,
 }
+
+
+# The host app owns its serializable settings; none of these are engine defaults.
+# Both presets are full snapshots, so Generate and Train can use different
+# sampling, heads, losses and propagation without overwriting one another.
+SETTING_DEFAULTS = {
+    "tool": "Scribble", "prompt": "Insert a dog", "object_name": "dog", "model": "InstructPix2Pix",
+    "selected_losses": ["coverage"],
+    "coverage_w": 1.0, "focal_w": 1.0, "moment_w": 1.0,
+    "centerline_w": 1.0, "centroid_w": 1.0, "outside_w": 1.0,
+    "steps": 30, "guide_steps": 10, "strength": 0.01, "seed": 42, "max_side": 256,
+    "flux_mode": "base", "flux_inpaint_strength": 0.8, "flux_cfg": 4.0,
+    "pix_text_cfg": 7.5, "pix_image_cfg": 1.5,
+    "head_mode": "Uniform", "selected_layers": [], "selected_heads": [], "manual_rows": [],
+    "adaptive_temperature": 0.01, "adaptive_ema": 0.5, "adaptive_mix": 0.1,
+    "learned_checkpoint": "", "dataset_path": "", "learned_temperature": 1.0,
+    "training_epochs": 1, "learning_rate": 0.001, "optimizer_name": "adamw", "weight_decay": 0.0,
+    "image_loss_name": "l1", "inside_weight": 1.0, "outside_weight": 1.0,
+    "lpips_weight": 0.0, "grad_clip": 1.0,
+    "use_propagation": False, "propagation_layers": [], "propagation_start": 3,
+    "propagation_stop": 10, "propagation_limit": 12, "propagation_threshold": 0.2,
+    "propagation_max_fraction": 0.3, "save_maps": False,
+}
+
+
+def save_ui_profile(profile: str, keys: list[str], *values):
+    settings = {key: normalize_component_value(value) for key, value in zip(keys, values)}
+    path = save_profile(profile, settings)
+    return f"Saved **{profile.title()}** settings to `{path}`."
+
+
+def restore_ui_profile(profile: str, keys: list[str]):
+    current = values_for_profile(profile, keys, SETTING_DEFAULTS)
+    values = []
+    for key in keys:
+        value = current[key]
+        if key in {"selected_layers", "selected_heads", "propagation_layers"}:
+            values.append(gr.update(choices=value, value=value))
+        else:
+            values.append(gr.update(value=value))
+    model, mode = current["model"], current["head_mode"]
+    return (
+        *values,
+        f"Loaded **{profile.title()}** settings from `{config_path()}`.",
+        None,  # Invalidate the in-memory attention catalog from another backend.
+        gr.update(visible=model == "FLUX.2 Klein"),
+        gr.update(visible=model == "InstructPix2Pix"),
+        gr.update(visible=mode == "Manual"),
+        gr.update(visible=mode == "Adaptive"),
+        gr.update(visible=mode == "Learned"),
+    )
 
 
 @lru_cache(maxsize=4)
@@ -250,7 +304,8 @@ def labels_from_catalog(catalog: dict, selected_layers: list[str] | None):
 def refresh_attention_choices(model_name, selected_layers, selected_heads):
     try:
         catalog = build_attention_catalog(model_name)
-        layer_values = list(selected_layers) if selected_layers else list(catalog["default_layers"])
+        layer_values = [name for name in (selected_layers or []) if name in catalog["layers"]]
+        layer_values = layer_values or list(catalog["default_layers"])
         head_choices = labels_from_catalog(catalog, layer_values)
         keep_heads = [head for head in (selected_heads or []) if head in head_choices]
         info = f"Loaded {len(catalog['layers'])} layers and {len(head_choices)} heads for the selected layers."
@@ -275,14 +330,15 @@ def refresh_attention_choices(model_name, selected_layers, selected_heads):
 
 def update_heads_from_layers(catalog, selected_layers, selected_heads):
     if not catalog:
-        return gr.update(), [], "Load attention choices first."
+        return gr.update(), gr.update(), "Load attention choices first."
     head_choices = labels_from_catalog(catalog, list(selected_layers or []))
     kept = [head for head in (selected_heads or []) if head in head_choices]
     return gr.update(choices=head_choices, value=kept), [[head, 1.0] for head in kept], f"Showing {len(head_choices)} heads."
 
 
-def update_manual_weight_table(selected_heads):
-    return [[head, 1.0] for head in (selected_heads or [])]
+def update_manual_weight_table(selected_heads, rows=None):
+    previous = parse_manual_weights(rows)
+    return [[head, previous.get(head, 1.0)] for head in (selected_heads or [])]
 
 
 def update_head_mode(mode):
@@ -363,7 +419,7 @@ def run(editor, selected_points, tool, prompt, object_name,
                 max_fraction=float(propagation_max_fraction),
             )
 
-        folder = Path("outputs") / time.strftime("%Y%m%d_%H%M%S")
+        folder = create_run_dir("generate")
         observer = FileObserver(folder, maps=save_maps, images=save_maps, interval=3)
         model_backend = backend(model)
         runner = Engine(model_backend, objective, guidance=guidance, policy=policy, transform=transform, observers=[observer])
@@ -382,6 +438,24 @@ def run(editor, selected_points, tool, prompt, object_name,
             data={"image": original, "prompt": prompt, "object_phrase": object_name},
             options=options,
         )
+        save_run_config(folder, {
+            "workflow": "generate", "model": model, "prompt": prompt, "object_phrase": object_name,
+            "visual_tool": tool, "points": selected_points or [],
+            "losses": [{"name": loss.name, "weight": loss.weight} for loss in objective.terms],
+            "guidance": vars(guidance), "head_mode": head_mode,
+            "selected_heads": selected_heads or [],
+            "manual_weights": parse_manual_weights(manual_rows) if head_mode == "Manual" else None,
+            "adaptive": {"temperature": adaptive_temperature, "ema": adaptive_ema, "mix": adaptive_mix},
+            "learned_checkpoint": learned_checkpoint if head_mode == "Learned" else None,
+            "propagation": ({"enabled": True, "start": propagation_start, "stop": propagation_stop,
+                             "limit": propagation_limit, "threshold": propagation_threshold,
+                             "max_fraction": propagation_max_fraction} if use_propagation else {"enabled": False}),
+            "model_options": options, "save_maps": bool(save_maps),
+            "source_size": list(original.size),
+        })
+        original.save(folder / "input.png")
+        if tool == "Scribble":
+            extract_scribble_mask(editor, original.size).save(folder / "visual_prompt.png")
         result = runner.run(request, visual)
         result.output.save(folder / "result.png")
         return result.output, f"Saved {folder} | {len(result.events)} steps"
@@ -398,7 +472,7 @@ def train_heads(dataset_file, dataset_path, model, selected_losses,
                 use_propagation, propagation_layers, propagation_start, propagation_stop,
                 propagation_limit, propagation_threshold, propagation_max_fraction,
                 epochs, learning_rate, optimizer_name, weight_decay, image_loss_name,
-                inside_weight, outside_weight, lpips_weight, grad_clip, checkpoint_file,
+                inside_weight, outside_weight, lpips_weight, grad_clip, _checkpoint_file,
                 progress=gr.Progress()):
     try:
         location = str(dataset_file or dataset_path or "").strip()
@@ -418,14 +492,17 @@ def train_heads(dataset_file, dataset_path, model, selected_losses,
         guidance = Guidance(strength=float(strength), max_steps=int(guide_steps),
                             layers=tuple(selected_layers or []) or None,
                             affinity_layers=tuple(propagation_layers or []) or None)
+        folder = create_run_dir("train")
+        checkpoint_path = folder / "learned_heads.json"
+        history_path = folder / "history.json"
         trainer = HeadTrainer(
             Engine(backend(model), objective, policy=policy,
                    guidance=guidance, transform=transform),
             config=TrainConfig(
                 epochs=int(epochs), learning_rate=float(learning_rate),
                 optimizer=str(optimizer_name), weight_decay=float(weight_decay), grad_clip=float(grad_clip),
-                checkpoint=str(checkpoint_file),
-                history=str(Path(checkpoint_file).with_suffix(".history.json")),
+                checkpoint=str(checkpoint_path),
+                history=str(history_path),
             ),
             image_loss=ImageLossConfig(
                 pixel=str(image_loss_name), inside_weight=float(inside_weight),
@@ -438,26 +515,56 @@ def train_heads(dataset_file, dataset_path, model, selected_losses,
                            cfg=float(flux_cfg))
         else:
             options.update(cfg=float(pix_text_cfg), image_cfg=float(pix_image_cfg), mode="base")
+        save_run_config(folder, {
+            "workflow": "train", "model": model, "dataset": location,
+            "losses": [{"name": loss.name, "weight": loss.weight} for loss in objective.terms],
+            "guidance": vars(guidance), "selected_layers": selected_layers or [],
+            "selected_heads": selected_heads or [], "learned_temperature": learned_temperature,
+            "train_config": vars(trainer.config), "image_loss": vars(trainer.criterion.config),
+            "propagation": ({"enabled": True, "start": propagation_start, "stop": propagation_stop,
+                             "limit": propagation_limit, "threshold": propagation_threshold,
+                             "max_fraction": propagation_max_fraction} if use_propagation else {"enabled": False}),
+            "model_options": options,
+        })
         def on_progress(done, total, event):
             progress((done, total), desc=f"Epoch {event['epoch']} | image loss {event['loss']:.5f}")
         result = trainer.fit(location, options=options, progress=on_progress)
+        save_training_reports(folder, result.history, result.head_labels, result.weights)
+        # The auto-saved training preset should remember the new checkpoint.
+        prefs = read_store()
+        save_profile("train", {**prefs["train"], "learned_checkpoint": result.checkpoint})
         weights = sorted(zip(result.head_labels, result.weights), key=lambda x: x[1], reverse=True)
         top = ", ".join(f"{name}: {weight:.3f}" for name, weight in weights[:3])
         return result.checkpoint, (
             f"Training completed: {len(result.history)} examples processed. "
             f"Last image loss: {result.history[-1]['loss']:.5f}. "
-            f"Saved: {result.checkpoint}. Top heads: {top}"
+            f"Saved training run: {folder}. Last image loss: {result.history[-1]['loss']:.5f}. "
+            f"Top heads: {top}"
         )
     except (ValueError, RuntimeError, TypeError, KeyError, ImportError, OSError) as error:
         raise gr.Error(f"Head-weight training failed: {error}") from error
 
 
 def build_demo():
+    saved_store = read_store()
+    active_profile = saved_store["active"]
+    saved_values = {**SETTING_DEFAULTS, **saved_store[active_profile]}
+    def initial(name):
+        return saved_values[name]
     with gr.Blocks(title="Visual Prompt Guidance — Example Application") as demo:
         gr.Markdown(
             "## Visual Prompt Guidance\n"
             "Use **one canvas** for all prompt types. Pick **Point**, **Box**, or **Scribble**; "
             "click on the same canvas for point/box, or draw directly for scribble."
+        )
+        with gr.Row():
+            save_generate_btn = gr.Button("Save Generate settings")
+            load_generate_btn = gr.Button("Load Generate settings")
+            save_train_btn = gr.Button("Save Training settings")
+            load_train_btn = gr.Button("Load Training settings")
+        preset_status = gr.Markdown(
+            f"Loaded **{active_profile.title()}** settings from `{config_path()}`. "
+            "Settings also save automatically when you start Generate or Train."
         )
         canvas_points = gr.State([])
         attention_catalog = gr.State(None)
@@ -475,7 +582,7 @@ def build_demo():
                 )
                 canvas_status = gr.Markdown("Upload an image first.")
                 with gr.Row():
-                    tool = gr.Radio(["Scribble", "Point", "Box"], value="Scribble", label="Active prompt tool")
+                    tool = gr.Radio(["Scribble", "Point", "Box"], value=initial("tool"), label="Active prompt tool")
                     clear_shape = gr.Button("Clear point / box")
                     clear_brush = gr.Button("Clear scribble")
                     clear_all_btn = gr.Button("Clear all")
@@ -484,58 +591,58 @@ def build_demo():
                 run_status = gr.Textbox(label="Run information", interactive=False)
 
         with gr.Row():
-            prompt = gr.Textbox(label="Text prompt", value="Insert a curved snake following the line")
-            object_name = gr.Textbox(label="Target object phrase", value="snake")
-            model = gr.Dropdown(["InstructPix2Pix", "FLUX.2 Klein"], value="InstructPix2Pix", label="Backend")
+            prompt = gr.Textbox(label="Text prompt", value=initial("prompt"))
+            object_name = gr.Textbox(label="Target object phrase", value=initial("object_name"))
+            model = gr.Dropdown(["InstructPix2Pix", "FLUX.2 Klein"], value=initial("model"), label="Backend")
 
         with gr.Accordion("Objective", open=True):
             selected_losses = gr.CheckboxGroup(
-                list(losses.BUILTIN_LOSSES), value=["coverage"], label="Enabled losses"
+                list(losses.BUILTIN_LOSSES), value=initial("selected_losses"), label="Enabled losses"
             )
             with gr.Row():
-                coverage_w = gr.Number(value=1.0, label="coverage")
-                focal_w = gr.Number(value=1.0, label="focal")
-                moment_w = gr.Number(value=1.0, label="moment")
+                coverage_w = gr.Number(value=initial("coverage_w"), label="coverage")
+                focal_w = gr.Number(value=initial("focal_w"), label="focal")
+                moment_w = gr.Number(value=initial("moment_w"), label="moment")
             with gr.Row():
-                centerline_w = gr.Number(value=1.0, label="centerline")
-                centroid_w = gr.Number(value=1.0, label="centroid")
-                outside_w = gr.Number(value=1.0, label="outside")
+                centerline_w = gr.Number(value=initial("centerline_w"), label="centerline")
+                centroid_w = gr.Number(value=initial("centroid_w"), label="centroid")
+                outside_w = gr.Number(value=initial("outside_w"), label="outside")
 
         with gr.Accordion("General guidance sampling", open=True):
             with gr.Row():
-                steps = gr.Slider(4, 60, value=30, step=1, label="Denoising steps")
-                guide_steps = gr.Slider(0, 30, value=10, step=1, label="Guided steps")
-                strength = gr.Slider(0, 0.1, value=0.01, step=0.001, label="Guidance strength")
+                steps = gr.Slider(4, 60, value=initial("steps"), step=1, label="Denoising steps")
+                guide_steps = gr.Slider(0, 30, value=initial("guide_steps"), step=1, label="Guided steps")
+                strength = gr.Slider(0, 0.1, value=initial("strength"), step=0.001, label="Guidance strength")
             with gr.Row():
-                seed = gr.Number(value=42, precision=0, label="Seed")
-                max_side = gr.Slider(128, 768, value=256, step=64, label="Maximum input side (px)")
+                seed = gr.Number(value=initial("seed"), precision=0, label="Seed")
+                max_side = gr.Slider(128, 768, value=initial("max_side"), step=64, label="Maximum input side (px)")
 
         with gr.Accordion("Backend-specific configuration", open=False):
-            flux_group = gr.Group(visible=False)
+            flux_group = gr.Group(visible=initial("model") == "FLUX.2 Klein")
             with flux_group:
                 gr.Markdown("### FLUX.2 Klein")
                 with gr.Row():
-                    flux_mode = gr.Dropdown(["base", "inpaint"], value="base", label="Mode")
-                    flux_inpaint_strength = gr.Slider(0.1, 1.0, value=0.8, step=0.05, label="Inpaint strength")
-                    flux_cfg = gr.Slider(1.0, 12.0, value=4.0, step=0.5, label="CFG scale")
-            pix_group = gr.Group(visible=True)
+                    flux_mode = gr.Dropdown(["base", "inpaint"], value=initial("flux_mode"), label="Mode")
+                    flux_inpaint_strength = gr.Slider(0.1, 1.0, value=initial("flux_inpaint_strength"), step=0.05, label="Inpaint strength")
+                    flux_cfg = gr.Slider(1.0, 12.0, value=initial("flux_cfg"), step=0.5, label="CFG scale")
+            pix_group = gr.Group(visible=initial("model") == "InstructPix2Pix")
             with pix_group:
                 gr.Markdown("### InstructPix2Pix")
                 with gr.Row():
-                    pix_text_cfg = gr.Slider(1.0, 12.0, value=7.5, step=0.5, label="Text guidance scale")
-                    pix_image_cfg = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Image guidance scale")
+                    pix_text_cfg = gr.Slider(1.0, 12.0, value=initial("pix_text_cfg"), step=0.5, label="Text guidance scale")
+                    pix_image_cfg = gr.Slider(1.0, 3.0, value=initial("pix_image_cfg"), step=0.1, label="Image guidance scale")
 
         with gr.Accordion("Attention heads", open=False):
             with gr.Row():
                 refresh_heads = gr.Button("Load available layers / heads")
                 attention_info = gr.Markdown("Load attention choices after selecting a backend.")
-            selected_layers = gr.CheckboxGroup(label="Guidance attention layers", choices=[])
+            selected_layers = gr.CheckboxGroup(label="Guidance attention layers", choices=initial("selected_layers"), value=initial("selected_layers"))
             selected_heads = gr.CheckboxGroup(
-                label="Include specific heads (optional)", choices=[],
+                label="Include specific heads (optional)", choices=initial("selected_heads"), value=initial("selected_heads"),
                 info="Empty = all heads from checked layers. Applies to Uniform, Adaptive and Learned."
             )
-            head_mode = gr.Radio(["Uniform", "Adaptive", "Manual", "Learned"], value="Uniform", label="Head policy")
-            manual_group = gr.Group(visible=False)
+            head_mode = gr.Radio(["Uniform", "Adaptive", "Manual", "Learned"], value=initial("head_mode"), label="Head policy")
+            manual_group = gr.Group(visible=initial("head_mode") == "Manual")
             with manual_group:
                 gr.Markdown("Select heads above, then edit the weight values below.")
                 manual_rows = gr.Dataframe(
@@ -544,37 +651,38 @@ def build_demo():
                     row_count=(0, "dynamic"),
                     col_count=(2, "fixed"),
                     interactive=True,
+                    value=initial("manual_rows"),
                     label="Selected heads and weights",
                 )
-            adaptive_group = gr.Group(visible=False)
+            adaptive_group = gr.Group(visible=initial("head_mode") == "Adaptive")
             with adaptive_group:
                 with gr.Row():
-                    adaptive_temperature = gr.Number(value=0.01, label="temperature")
-                    adaptive_ema = gr.Number(value=0.5, label="ema")
-                    adaptive_mix = gr.Number(value=0.1, label="uniform mix")
-            learned_group = gr.Group(visible=False)
+                    adaptive_temperature = gr.Number(value=initial("adaptive_temperature"), label="temperature")
+                    adaptive_ema = gr.Number(value=initial("adaptive_ema"), label="ema")
+                    adaptive_mix = gr.Number(value=initial("adaptive_mix"), label="uniform mix")
+            learned_group = gr.Group(visible=initial("head_mode") == "Learned")
             with learned_group:
                 gr.Markdown("### Trainable head weights (higher-order gradients)")
                 learned_checkpoint = gr.Textbox(
-                    value="outputs/learned_heads.json", label="Weights checkpoint (JSON)",
+                    value=initial("learned_checkpoint"), label="Weights checkpoint (JSON)",
                     info="Train using the controls below, or enter an existing checkpoint for inference."
                 )
                 with gr.Row():
                     dataset_file = gr.File(label="Upload dataset ZIP (manifest.json + images)",
                                            file_types=[".zip"], type="filepath")
-                    dataset_path = gr.Textbox(label="Or dataset folder / manifest.json on server", value="")
+                    dataset_path = gr.Textbox(label="Or dataset folder / manifest.json on server", value=initial("dataset_path"))
                 with gr.Row():
-                    learned_temperature = gr.Number(value=1.0, label="Learned softmax temperature")
-                    training_epochs = gr.Number(value=1, precision=0, label="Epochs")
-                    learning_rate = gr.Number(value=0.001, label="Learning rate")
-                    optimizer_name = gr.Dropdown(["adamw", "adam", "sgd"], value="adamw", label="Optimizer")
-                    weight_decay = gr.Number(value=0.0, label="Weight decay")
+                    learned_temperature = gr.Number(value=initial("learned_temperature"), label="Learned softmax temperature")
+                    training_epochs = gr.Number(value=initial("training_epochs"), precision=0, label="Epochs")
+                    learning_rate = gr.Number(value=initial("learning_rate"), label="Learning rate")
+                    optimizer_name = gr.Dropdown(["adamw", "adam", "sgd"], value=initial("optimizer_name"), label="Optimizer")
+                    weight_decay = gr.Number(value=initial("weight_decay"), label="Weight decay")
                 with gr.Row():
-                    image_loss_name = gr.Dropdown(["l1", "mse", "charbonnier", "smooth_l1"], value="l1", label="Image pixel loss")
-                    inside_weight = gr.Number(value=1.0, label="Edit-region weight")
-                    outside_weight = gr.Number(value=1.0, label="Preservation weight")
-                    lpips_weight = gr.Number(value=0.0, label="Global LPIPS weight (optional)")
-                    grad_clip = gr.Number(value=1.0, label="Gradient clipping norm")
+                    image_loss_name = gr.Dropdown(["l1", "mse", "charbonnier", "smooth_l1"], value=initial("image_loss_name"), label="Image pixel loss")
+                    inside_weight = gr.Number(value=initial("inside_weight"), label="Edit-region weight")
+                    outside_weight = gr.Number(value=initial("outside_weight"), label="Preservation weight")
+                    lpips_weight = gr.Number(value=initial("lpips_weight"), label="Global LPIPS weight (optional)")
+                    grad_clip = gr.Number(value=initial("grad_clip"), label="Gradient clipping norm")
                 gr.Markdown("**Note:** Training backpropagates through every denoising step and each guidance gradient. "
                             "Start with 4 denoising steps, 1–2 guided steps, and 128–256px images; "
                             "larger settings can exceed GPU memory.")
@@ -582,20 +690,36 @@ def build_demo():
                 train_status = gr.Textbox(label="Training status", interactive=False)
 
         with gr.Accordion("Propagation", open=False):
-            use_propagation = gr.Checkbox(value=False, label="Enable affinity-based propagation")
-            propagation_layers = gr.CheckboxGroup(label="Affinity layers", choices=[])
+            use_propagation = gr.Checkbox(value=initial("use_propagation"), label="Enable affinity-based propagation")
+            propagation_layers = gr.CheckboxGroup(label="Affinity layers", choices=initial("propagation_layers"), value=initial("propagation_layers"))
             with gr.Row():
-                propagation_start = gr.Number(value=3, label="start step")
-                propagation_stop = gr.Number(value=10, label="stop step")
-                propagation_limit = gr.Number(value=12, label="max new cells / step")
+                propagation_start = gr.Number(value=initial("propagation_start"), label="start step")
+                propagation_stop = gr.Number(value=initial("propagation_stop"), label="stop step")
+                propagation_limit = gr.Number(value=initial("propagation_limit"), label="max new cells / step")
             with gr.Row():
-                propagation_threshold = gr.Number(value=0.2, label="similarity threshold")
-                propagation_max_fraction = gr.Number(value=0.3, label="max area fraction")
+                propagation_threshold = gr.Number(value=initial("propagation_threshold"), label="similarity threshold")
+                propagation_max_fraction = gr.Number(value=initial("propagation_max_fraction"), label="max area fraction")
 
         with gr.Accordion("Diagnostics", open=False):
-            save_maps = gr.Checkbox(value=False, label="Save per-head maps / PNGs")
+            save_maps = gr.Checkbox(value=initial("save_maps"), label="Save per-head maps / PNGs")
 
         submit = gr.Button("Generate", variant="primary")
+
+        component_scope = locals().copy()
+        settings_components = {name: component_scope[name] for name in SETTING_DEFAULTS}
+        setting_names = list(SETTING_DEFAULTS)
+        setting_values = [settings_components[name] for name in setting_names]
+
+        save_generate_btn.click(lambda *args: save_ui_profile("generate", setting_names, *args),
+                                setting_values, [preset_status])
+        save_train_btn.click(lambda *args: save_ui_profile("train", setting_names, *args),
+                             setting_values, [preset_status])
+        restore_outputs = [*setting_values, preset_status, attention_catalog,
+                           flux_group, pix_group, manual_group, adaptive_group, learned_group]
+        load_generate_btn.click(lambda: restore_ui_profile("generate", setting_names),
+                                outputs=restore_outputs)
+        load_train_btn.click(lambda: restore_ui_profile("train", setting_names),
+                             outputs=restore_outputs)
 
         canvas.change(lambda current_tool, points: status_for_tool(current_tool, points or []), [tool, canvas_points], [canvas_status])
         canvas.select(on_canvas_select, [canvas, tool, canvas_points], [canvas_points, canvas, canvas_status])
@@ -611,9 +735,12 @@ def build_demo():
             [attention_catalog, selected_layers, propagation_layers, selected_heads, manual_rows, attention_info],
         )
         selected_layers.change(update_heads_from_layers, [attention_catalog, selected_layers, selected_heads], [selected_heads, manual_rows, attention_info])
-        selected_heads.change(update_manual_weight_table, [selected_heads], [manual_rows])
+        selected_heads.change(update_manual_weight_table, [selected_heads, manual_rows], [manual_rows])
         head_mode.change(update_head_mode, [head_mode], [manual_group, adaptive_group, learned_group])
         train_button.click(
+            lambda *args: save_ui_profile("train", setting_names, *args),
+            setting_values, [preset_status], queue=False,
+        ).then(
             train_heads,
             [dataset_file, dataset_path, model, selected_losses,
              coverage_w, focal_w, moment_w, centerline_w, centroid_w, outside_w,
@@ -628,6 +755,9 @@ def build_demo():
         )
 
         submit.click(
+            lambda *args: save_ui_profile("generate", setting_names, *args),
+            setting_values, [preset_status], queue=False,
+        ).then(
             run,
             [canvas, canvas_points, tool, prompt, object_name,
              selected_losses, coverage_w, focal_w, moment_w, centerline_w, centroid_w, outside_w,
