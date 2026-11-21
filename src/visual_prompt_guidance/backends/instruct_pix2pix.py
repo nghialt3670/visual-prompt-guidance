@@ -63,7 +63,11 @@ class InstructPix2Pix:
         dtype = ((torch.float16 if device != "cpu" else torch.float32)
                  if self.dtype == "auto" else
                  {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[self.dtype])
-        pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(self.model_id, torch_dtype=dtype)
+        pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+            self.model_id,
+            variant="fp16" if dtype == torch.float16 else None,
+            dtype=dtype,
+        )
         if self.cpu_offload:
             if device != "cuda":
                 raise ValueError("CPU offload currently requires CUDA")
@@ -71,6 +75,7 @@ class InstructPix2Pix:
         else:
             pipe.to(device)
         pipe.unet.eval().requires_grad_(False)
+        pipe.vae.eval().requires_grad_(False)
         self._pipe = pipe
         return pipe
 
@@ -219,6 +224,19 @@ class InstructPix2Pix:
             prediction.output, step, state.latents,
             **state.step_kwargs, return_dict=False,
         )[0]
+
+    def decode_tensor(self, state: _State) -> torch.Tensor:
+        """Differentiable VAE decode, RGB float tensor [B,3,H,W] in [0,1]."""
+        import torch.nn.functional as F
+        pipe = self._pipe
+        latent = state.latents / pipe.vae.config.scaling_factor
+        pixels = pipe.vae.decode(latent.to(dtype=pipe.vae.dtype), return_dict=False)[0]
+        pixels = (pixels.float() / 2 + 0.5).clamp(0, 1)
+        original_w, original_h = state.original_size
+        if pixels.shape[-2:] != (original_h, original_w):
+            pixels = F.interpolate(pixels, size=(original_h, original_w),
+                                   mode="bilinear", align_corners=False)
+        return pixels
 
     def decode(self, state: _State) -> Image.Image:
         pipe = self._pipe

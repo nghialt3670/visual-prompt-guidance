@@ -116,6 +116,16 @@ class ModelAdapter(Protocol):
     def decode(self, state: Any) -> Any: ...
 
 
+class DifferentiableModelAdapter(ModelAdapter, Protocol):
+    """Additional capability required for image-level, higher-order training.
+
+    Decode the current latent without torch.no_grad(), detaching, converting
+    to NumPy/PIL, or silently changing to an intermediate low-resolution output.
+    The returned tensor must be RGB [B,3,H,W], float in [0,1], at source size.
+    """
+    def decode_tensor(self, state: Any) -> torch.Tensor: ...
+
+
 class TargetTransform(Protocol):
     def reset(self, target: Target) -> None: ...
     def requires_affinity(self, step_index: int) -> bool: ...

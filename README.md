@@ -200,3 +200,122 @@ Validation: 7 new offline adapter/hook integration tests and 9 existing
 framework tests pass. Full `timbrooks/instruct-pix2pix` checkpoint inference
 has not been executed in the build environment; exact runtime compatibility
 and image quality still require GPU/MPS validation.
+
+## Train attention-head weights from edited-image examples (v0.4)
+
+**Learned** is a fourth head policy alongside Uniform, Manual and Adaptive. It
+optimizes *only the per-head softmax logits* against reference edited images.
+The generator's weights remain frozen. The training path uses higher-order PyTorch
+gradients through the attention loss, latent guidance update, denoising scheduler,
+and VAE decoder. This is **image-level supervision**, not attention-mask fitting.
+
+### Dataset
+
+Provide a folder containing `manifest.json` and the referenced image files, or a
+ZIP whose root contains them. Input and reference edited images **must be the
+same dimensions**. Coordinates in the visual prompt refer to the input image.
+
+```text
+my_training_data/
+  manifest.json
+  input_001.png
+  edited_001.png
+  edit_mask_001.png   # optional, white=changed region
+```
+
+`manifest.json` is a JSON array (or `{"samples": [...]}`):
+
+```json
+[
+  {
+    "input_image": "input_001.png",
+    "target_image": "edited_001.png",
+    "edit_mask": "edit_mask_001.png",
+    "prompt": "Add a red dog following the curved line",
+    "object_phrase": "dog",
+    "visual": {
+      "type": "scribble",
+      "path": [[20, 30], [48, 35], [76, 50]],
+      "width": 6
+    }
+  }
+]
+```
+
+Valid visual annotations:
+- `{"type":"point", "x":40, "y":50, "sigma":12, "edit_radius":48}`
+- `{"type":"box", "x0":20, "y0":30, "x1":100, "y1":150}`
+- `{"type":"scribble", "path":[[x,y], ...], "width":6}`
+- `{"type":"scribble", "mask":"scribble_mask.png"}`
+
+The `edit_mask` is optional; when omitted, the visual prompt's projected edit
+region is used as a rough training mask. For high-quality supervision, provide a
+true changed-region mask. Global LPIPS (if enabled) is calculated **on the entire
+output image**, not on a cropped or masked image; preservation is controlled by
+the outside-region pixel loss.
+
+### UI
+
+Launch `examples/gradio_app.py` and choose **Learned** under **Attention heads**.
+Optionally select layers and individual heads using checkboxes. Under the
+**Trainable head weights** panel, upload the ZIP or supply a dataset directory,
+select an outer image loss (`l1`, `mse`, `charbonnier`, or `smooth_l1`), set the
+inside/outside weights, epochs, optimizer, learning rate, gradient clipping, and
+checkpoint path. Click **Train head weights**. The generated JSON checkpoint is
+used by the **Generate** button while Learned mode is selected. Adaptive and
+Manual remain available and unchanged.
+
+### Command line
+
+```bash
+uv sync --extra pix2pix --extra ui --extra dev
+
+uv run --extra pix2pix python examples/train_heads.py \
+  --backend pix2pix \
+  --dataset ./my_training_data \
+  --steps 4 --guided-steps 1 --max-side 128 \
+  --epochs 2 --lr 0.001 --loss l1 \
+  --inside-weight 1 --outside-weight 1 \
+  --output outputs/learned_heads.json
+```
+
+For optional LPIPS: `uv sync --extra pix2pix --extra perceptual`; then set
+`--lpips-weight 0.1` (may download LPIPS feature-network weights).
+
+### Python API
+
+```python
+from visual_prompt_guidance import (
+    Engine, Guidance, Objective, Loss, Learned, HeadTrainer,
+    TrainConfig, ImageLossConfig, losses,
+)
+from visual_prompt_guidance.backends import InstructPix2Pix
+
+policy = Learned(selected=None, temperature=1.0)
+engine = Engine(
+    backend=InstructPix2Pix(),
+    objective=Objective(Loss("coverage", losses.coverage)),
+    guidance=Guidance(strength=0.01, max_steps=1),
+    policy=policy,
+)
+trainer = HeadTrainer(
+    engine,
+    config=TrainConfig(epochs=2, learning_rate=1e-3,
+                       checkpoint="outputs/learned_heads.json"),
+    image_loss=ImageLossConfig(pixel="l1", inside_weight=1.0,
+                               outside_weight=1.0),
+)
+trainer.fit("my_training_data", options={"steps":4, "max_side":128, "seed":42})
+
+# Later, for normal low-memory inference:
+trained_policy = Learned.load("outputs/learned_heads.json")
+```
+
+**Memory:** This is full unrolled, second-order training, not a cheap
+attention-only proxy. Every denoising step remains differentiable. PyTorch's
+math SDPA is forced on CUDA because fused Flash/memory-efficient attention may
+not support double backward. It can use **significantly more VRAM** than normal
+sampling. Start with 4 steps, 1 guided step and 128px resolution, and train
+one image per optimizer step. Large FLUX models may still be impractical.
+No real-checkpoint/GPU training run is claimed: the included CPU tests use a
+differentiable mock generator and validate higher-order gradients numerically.

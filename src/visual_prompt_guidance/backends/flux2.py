@@ -67,6 +67,7 @@ class Flux2Klein:
         else:
             pipe.to(device)
         pipe.transformer.eval().requires_grad_(False)
+        pipe.vae.eval().requires_grad_(False)
         self._pipe, self._loaded_mode = pipe,mode
 
     @staticmethod
@@ -202,8 +203,14 @@ class Flux2Klein:
             batch=AttentionBatch(head_maps,labels,affinity)
         if state.cfg>1:
             # Avoid constructing an unnecessary unconditional gradient graph.
-            with torch.no_grad():
+            # During differentiable sampling the negative branch contributes
+            # to the derivative of the denoising prediction. During ordinary
+            # guidance, computing it without a graph saves substantial memory.
+            if torch.is_grad_enabled() and attention is None:
                 negative_pred=self._predict(state,step,False)
+            else:
+                with torch.no_grad():
+                    negative_pred=self._predict(state,step,False)
             conditional_pred=negative_pred+state.cfg*(conditional_pred-negative_pred)
         return Prediction(conditional_pred,batch)
 
@@ -219,6 +226,31 @@ class Flux2Klein:
             latents=(1-mask)*original+mask*latents
         state.latent_data=latents
         state.position+=1
+
+    def decode_tensor(self, state: _KleinState) -> torch.Tensor:
+        """Differentiable FLUX.2 VAE decode, RGB float [B,3,H,W] in [0,1]."""
+        import torch.nn.functional as F
+        from diffusers.utils.torch_utils import get_module_execution_device
+        pipe = self._pipe
+        gh, gw = state.grid
+        try:
+            unpacked = pipe._unpack_latents_with_ids(state.latent_data, state.latent_ids)
+        except TypeError:
+            unpacked = pipe._unpack_latents_with_ids(state.latent_data, state.latent_ids, gh, gw)
+        mean = pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(unpacked.device, unpacked.dtype)
+        std = torch.sqrt(
+            pipe.vae.bn.running_var.view(1, -1, 1, 1).to(unpacked.device, unpacked.dtype)
+            + pipe.vae.config.batch_norm_eps
+        )
+        latents = pipe._unpatchify_latents(unpacked * std + mean)
+        latents = latents.to(get_module_execution_device(pipe.vae), dtype=pipe.vae.dtype)
+        pixels = pipe.vae.decode(latents, return_dict=False)[0]
+        pixels = (pixels.float() / 2 + 0.5).clamp(0, 1)
+        original_w, original_h = state.original_size
+        if pixels.shape[-2:] != (original_h, original_w):
+            pixels = F.interpolate(pixels, size=(original_h, original_w),
+                                   mode="bilinear", align_corners=False)
+        return pixels
 
     def decode(self,state: _KleinState) -> Image.Image:
         from diffusers.utils.torch_utils import get_module_execution_device

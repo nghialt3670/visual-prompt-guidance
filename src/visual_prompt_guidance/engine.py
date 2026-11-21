@@ -24,8 +24,8 @@ class Guidance:
 def rms_update(latent: torch.Tensor, gradient: torch.Tensor, cfg: Guidance) -> tuple[torch.Tensor, float]:
     rms = gradient.float().square().mean().sqrt()
     scale = rms.clamp_min(1e-8) if cfg.normalize_gradient else 1.0
-    updated = (latent.float() - cfg.strength*gradient.float()/scale).detach()
-    return updated.to(dtype=latent.dtype), float(rms.item())
+    updated = latent.float() - cfg.strength * gradient.float() / scale
+    return updated.to(dtype=latent.dtype), float(rms.detach().item())
 
 
 class Engine:
@@ -52,6 +52,32 @@ class Engine:
         self.transform, self.observers, self.updater = transform, tuple(observers), updater
 
     def run(self, request: Request, prompt: VisualPrompt) -> Result:
+        """Standard low-memory inference; detaches latent updates and uses no-grad sampling."""
+        return self._run(request, prompt, differentiable=False)
+
+    def run_differentiable(self, request: Request, prompt: VisualPrompt) -> Result:
+        """Higher-order differentiable sampling for head-weight training.
+
+        output is a [B,3,H,W] float image tensor in [0,1] with an autograd
+        path through every denoising step AND each inner latent guidance step.
+        This intentionally retains the full computation graph; model adapters
+        must provide a differentiable decode_tensor(state).
+        """
+        if not hasattr(self.backend, "decode_tensor"):
+            raise TypeError("Differentiable sampling requires backend.decode_tensor(state)")
+        if self.policy.needs_feedback:
+            raise ValueError("Differentiable training requires a non-adaptive head policy")
+        if not self.guidance.strength or self.guidance.max_steps == 0:
+            raise ValueError("Differentiable training needs at least one guided sampling step")
+        # Flash/memory-efficient CUDA SDPA generally does not implement
+        # double backward. Use the math kernel for higher-order guidance.
+        if torch.cuda.is_available():
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            with sdpa_kernel(backends=[SDPBackend.MATH]):
+                return self._run(request, prompt, differentiable=True)
+        return self._run(request, prompt, differentiable=True)
+
+    def _run(self, request: Request, prompt: VisualPrompt, *, differentiable: bool) -> Result:
         space = self.backend.space(request)
         target = prompt.project(space)
         state = self.backend.prepare(request, target)
@@ -73,7 +99,10 @@ class Engine:
             losses={}; rms=None; labels=(); weights=(); before=(); after=(); maps_cpu=None; extras={}
             if guided:
                 with torch.enable_grad():
-                    original=self.backend.latent(state).detach().requires_grad_(True)
+                    current = self.backend.latent(state)
+                    original = current if differentiable else current.detach()
+                    if not original.requires_grad:
+                        original = original.requires_grad_(True)
                     self.backend.set_latent(state,original)
                     pre=self.backend.forward(state,step,attention=capture)
                     batch=pre.attention
@@ -85,17 +114,24 @@ class Engine:
                     if self.transform is not None:
                         target=self.transform.apply(target,batch,index)
                     w=self.policy.weights(labels,device=batch.maps.device)
-                    w=w.detach().float()
+                    w=w.float() if differentiable else w.detach().float()
                     if w.shape!=(len(labels),) or (w<0).any() or not torch.isfinite(w).all() or w.sum()<=0:
                         raise ValueError("Head policy produced invalid weights")
                     w=w/w.sum()
                     weighted=aggregate(batch.maps,w)
                     component_total, parts=self.objective.evaluate(weighted,target)
                     scalar=component_total.mean()
-                    grad=torch.autograd.grad(scalar,original,allow_unused=True)[0]
+                    grad=torch.autograd.grad(
+                        scalar, original, create_graph=differentiable, allow_unused=True
+                    )[0]
                     if grad is None:
                         raise RuntimeError("Guidance loss has no gradient to model latent; check attention extraction")
                     new_latent,rms=self.updater(original,grad,cfg)
+                    if differentiable:
+                        if not new_latent.requires_grad or new_latent.grad_fn is None:
+                            raise RuntimeError("Updater detached the latent; cannot train head weights")
+                    else:
+                        new_latent=new_latent.detach()
                     self.backend.set_latent(state,new_latent)
                     losses={k:float(v.mean().item()) for k,v in parts.items()}
                     losses["total"]=float(scalar.item())
@@ -106,10 +142,10 @@ class Engine:
                         before = tuple(float(x) for x in before_scores.mean(0).cpu().tolist())
                     if any(o.wants_maps for o in self.observers):
                         maps_cpu=batch.maps.detach().float().cpu()
-                    weights=tuple(float(x) for x in w.cpu().tolist())
+                    weights=tuple(float(x) for x in w.detach().cpu().tolist())
                     del pre,batch,weighted,component_total,parts,scalar,grad,original
             # The native backend owns CFG/negative predictions and scheduler behavior.
-            with torch.no_grad():
+            with torch.set_grad_enabled(differentiable):
                 post=self.backend.forward(state,step,attention=capture if guided and self.policy.needs_feedback else None)
                 if guided and self.policy.needs_feedback:
                     if post.attention is None or post.attention.labels!=labels:
@@ -127,7 +163,10 @@ class Engine:
                 obs.step(event)
             # Streaming observers own map export; don't retain huge maps in every Result.
             records.append(replace(event, head_maps=None))
-        result=Result(output=self.backend.decode(state),events=tuple(records),target=target)
+        output = self.backend.decode_tensor(state) if differentiable else self.backend.decode(state)
+        if differentiable and (not isinstance(output, torch.Tensor) or not output.requires_grad):
+            raise RuntimeError("Backend returned a detached/non-Tensor image in differentiable mode")
+        result=Result(output=output,events=tuple(records),target=target)
         for obs in self.observers:
             obs.end(result)
         return result

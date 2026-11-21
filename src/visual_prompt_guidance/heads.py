@@ -83,3 +83,133 @@ class Adaptive:
         candidate = (1 - self.mix) * soft + self.mix * uniform
         self._weights = ((1 - self.ema) * self._weights.to(soft.device) + self.ema * candidate).detach()
         self._weights = self._weights / self._weights.sum()
+
+class Learned(torch.nn.Module):
+    """Trainable, global per-head logits with a stable identity set.
+
+    During training, initialize lazily on the first guided forward. The Trainer
+    creates its optimizer *after* this initialization. At inference time load
+    trained weights with Learned.load(path). Unselected heads receive exactly 0.
+    """
+    needs_feedback = False
+
+    def __init__(self, *, selected: tuple[str, ...] | None = None, temperature: float = 1.0):
+        super().__init__()
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Learned temperature must be positive and finite")
+        if selected is not None and (not selected or len(set(selected)) != len(selected)):
+            raise ValueError("Selected heads must be nonempty and unique")
+        self.selected = tuple(selected) if selected is not None else None
+        self.temperature = float(temperature)
+        self.labels: tuple[str, ...] | None = None
+        self.logits: torch.nn.Parameter | None = None
+        self._inference_checkpoint = False
+
+    def reset(self) -> None:
+        # Do not reset learned parameters between images; their meaning is global.
+        pass
+
+    def weights(self, labels: tuple[str, ...], *, device: torch.device) -> torch.Tensor:
+        if not labels or len(set(labels)) != len(labels):
+            raise ValueError("Expected nonempty unique head labels")
+        if self.labels is None:
+            chosen = self.selected if self.selected is not None else labels
+            absent = set(chosen) - set(labels)
+            if absent:
+                raise ValueError(f"Selected heads missing from backend: {sorted(absent)}")
+            self.labels = labels
+            self.logits = torch.nn.Parameter(torch.zeros(len(chosen), device=device, dtype=torch.float32))
+        elif labels != self.labels:
+            raise ValueError("Learned head identities/order changed; keep layers identical across the dataset")
+        if self.logits.device != device:
+            if self._inference_checkpoint:
+                # Checkpoint inference can migrate to the backend's actual
+                # device. Training must never replace a registered optimizer param.
+                self.logits = torch.nn.Parameter(self.logits.detach().to(device))
+            else:
+                raise ValueError("Learned policy is on the wrong device; call policy.to(device) BEFORE optimizer creation")
+        chosen = self.selected if self.selected is not None else labels
+        indices = torch.tensor([labels.index(h) for h in chosen], device=device, dtype=torch.long)
+        probs = torch.softmax(self.logits / self.temperature, dim=0)
+        return torch.zeros(len(labels), dtype=probs.dtype, device=device).scatter(0, indices, probs)
+
+    def update(self, labels, before, after) -> None:
+        # Offline image-level training updates logits using torch.optim.
+        pass
+
+    def save(self, path: str | 'Path') -> None:
+        import json
+        from pathlib import Path
+        if self.labels is None or self.logits is None:
+            raise ValueError("Learned policy has not been initialized")
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "format": "visual-prompt-guidance/learned-heads-v1",
+            "labels": list(self.labels),
+            "selected": list(self.selected) if self.selected is not None else None,
+            "temperature": self.temperature,
+            "logits": [float(x) for x in self.logits.detach().cpu().tolist()],
+        }
+        dest.write_text(json.dumps(payload, indent=2))
+
+    @classmethod
+    def load(cls, path: str | 'Path', *, device: str | torch.device = "cpu") -> 'Learned':
+        import json
+        from pathlib import Path
+        payload = json.loads(Path(path).read_text())
+        if payload.get("format") != "visual-prompt-guidance/learned-heads-v1":
+            raise ValueError("Unrecognized learned-head checkpoint format")
+        labels = tuple(payload["labels"])
+        selected = tuple(payload["selected"]) if payload["selected"] is not None else None
+        obj = cls(selected=selected, temperature=float(payload["temperature"]))
+        chosen = selected if selected is not None else labels
+        if not labels or len(set(labels)) != len(labels) or len(payload["logits"]) != len(chosen):
+            raise ValueError("Invalid learned-head checkpoint")
+        if set(chosen) - set(labels):
+            raise ValueError("Selected checkpoint heads absent from labels")
+        obj.labels = labels
+        obj._inference_checkpoint = True
+        obj.logits = torch.nn.Parameter(torch.tensor(payload["logits"], device=device, dtype=torch.float32))
+        if not torch.isfinite(obj.logits).all():
+            raise ValueError("Checkpoint contains non-finite logits")
+        return obj
+
+
+class HeadSubset:
+    """Optional, identity-based head filter for any existing policy.
+
+    Unselected heads always have zero weight, including in Adaptive updates.
+    Unlike filtering the attention tensor, this preserves native head labels
+    and lets backends capture the same layer set.
+    """
+    def __init__(self, policy, selected: tuple[str, ...]):
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("HeadSubset requires unique, nonempty head IDs")
+        self.policy = policy
+        self.selected = tuple(selected)
+        self.needs_feedback = policy.needs_feedback
+
+    def reset(self):
+        self.policy.reset()
+
+    def _indices(self, labels):
+        unavailable = set(self.selected) - set(labels)
+        if unavailable:
+            raise ValueError(f"Unknown head IDs: {sorted(unavailable)}")
+        selected = tuple(h for h in labels if h in self.selected)
+        indices = [labels.index(h) for h in selected]
+        return selected, indices
+
+    def weights(self, labels, *, device):
+        selected, indices = self._indices(labels)
+        active = self.policy.weights(selected, device=device)
+        if active.shape != (len(indices),):
+            raise ValueError("Child policy returned invalid subset weights")
+        return torch.zeros(len(labels), device=device, dtype=active.dtype).scatter(
+            0, torch.tensor(indices, device=device), active
+        )
+
+    def update(self, labels, before, after):
+        selected, indices = self._indices(labels)
+        self.policy.update(selected, before[:, indices], after[:, indices])

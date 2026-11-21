@@ -17,7 +17,9 @@ from PIL import Image, ImageDraw
 
 from visual_prompt_guidance import (
     Engine, Request, Guidance, Point, Box, Scribble,
-    Objective, Loss, Uniform, Manual, Adaptive, AffinityGrow, FileObserver, losses,
+    Objective, Loss, Uniform, Manual, Adaptive, Learned, HeadSubset,
+    HeadTrainer, TrainConfig, ImageLossConfig,
+    AffinityGrow, FileObserver, losses,
 )
 from visual_prompt_guidance.backends import Flux2Klein, InstructPix2Pix
 
@@ -284,11 +286,10 @@ def update_manual_weight_table(selected_heads):
 
 
 def update_head_mode(mode):
-    manual_visible = mode == "Manual"
-    adaptive_visible = mode == "Adaptive"
     return (
-        gr.update(visible=manual_visible),
-        gr.update(visible=adaptive_visible),
+        gr.update(visible=mode == "Manual"),
+        gr.update(visible=mode == "Adaptive"),
+        gr.update(visible=mode == "Learned"),
     )
 
 
@@ -320,7 +321,8 @@ def run(editor, selected_points, tool, prompt, object_name,
         model, steps, guide_steps, strength, seed, max_side,
         flux_mode, flux_inpaint_strength, flux_cfg,
         pix_text_cfg, pix_image_cfg,
-        head_mode, selected_layers, manual_rows, adaptive_temperature, adaptive_ema, adaptive_mix,
+        head_mode, selected_layers, selected_heads, manual_rows, adaptive_temperature, adaptive_ema, adaptive_mix,
+        learned_checkpoint,
         use_propagation, propagation_layers, propagation_start, propagation_stop, propagation_limit,
         propagation_threshold, propagation_max_fraction,
         save_maps):
@@ -333,8 +335,17 @@ def run(editor, selected_points, tool, prompt, object_name,
             policy = Adaptive(temperature=float(adaptive_temperature), ema=float(adaptive_ema), mix=float(adaptive_mix))
         elif head_mode == "Manual":
             policy = Manual(parse_manual_weights(manual_rows))
+        elif head_mode == "Learned":
+            if not learned_checkpoint or not Path(learned_checkpoint).is_file():
+                raise ValueError("Train head weights first, or specify a valid learned-head checkpoint")
+            policy = Learned.load(learned_checkpoint)
+            expected_selection = set(policy.selected or policy.labels)
+            if selected_heads and set(selected_heads) != expected_selection:
+                raise ValueError("Head selection differs from the learned checkpoint; select matching heads or clear the checkbox selection")
         else:
             policy = Uniform()
+        if selected_heads and head_mode in ("Adaptive", "Uniform"):
+            policy = HeadSubset(policy, tuple(selected_heads))
 
         guidance = Guidance(
             strength=float(strength),
@@ -377,6 +388,68 @@ def run(editor, selected_points, tool, prompt, object_name,
     except (ValueError, RuntimeError, TypeError, KeyError) as error:
         raise gr.Error(str(error)) from error
 
+
+
+def train_heads(dataset_file, dataset_path, model, selected_losses,
+                coverage_w, focal_w, moment_w, centerline_w, centroid_w, outside_w,
+                steps, guide_steps, strength, seed, max_side,
+                flux_mode, flux_inpaint_strength, flux_cfg, pix_text_cfg, pix_image_cfg,
+                selected_layers, selected_heads, learned_temperature,
+                use_propagation, propagation_layers, propagation_start, propagation_stop,
+                propagation_limit, propagation_threshold, propagation_max_fraction,
+                epochs, learning_rate, optimizer_name, weight_decay, image_loss_name,
+                inside_weight, outside_weight, lpips_weight, grad_clip, checkpoint_file,
+                progress=gr.Progress()):
+    try:
+        location = str(dataset_file or dataset_path or "").strip()
+        if not location:
+            raise ValueError("Provide a dataset ZIP or a server-side manifest.json / directory")
+        objective = collect_loss_terms(selected_losses, coverage_w, focal_w, moment_w,
+                                       centerline_w, centroid_w, outside_w)
+        policy = Learned(
+            selected=tuple(selected_heads) if selected_heads else None,
+            temperature=float(learned_temperature),
+        )
+        transform = AffinityGrow(
+            start=int(propagation_start), stop=int(propagation_stop),
+            limit=int(propagation_limit), threshold=float(propagation_threshold),
+            max_fraction=float(propagation_max_fraction),
+        ) if use_propagation else None
+        guidance = Guidance(strength=float(strength), max_steps=int(guide_steps),
+                            layers=tuple(selected_layers or []) or None,
+                            affinity_layers=tuple(propagation_layers or []) or None)
+        trainer = HeadTrainer(
+            Engine(backend(model), objective, policy=policy,
+                   guidance=guidance, transform=transform),
+            config=TrainConfig(
+                epochs=int(epochs), learning_rate=float(learning_rate),
+                optimizer=str(optimizer_name), weight_decay=float(weight_decay), grad_clip=float(grad_clip),
+                checkpoint=str(checkpoint_file),
+                history=str(Path(checkpoint_file).with_suffix(".history.json")),
+            ),
+            image_loss=ImageLossConfig(
+                pixel=str(image_loss_name), inside_weight=float(inside_weight),
+                outside_weight=float(outside_weight), lpips_weight=float(lpips_weight),
+            ),
+        )
+        options = {"steps": int(steps), "seed": int(seed), "max_side": int(max_side)}
+        if model == "FLUX.2 Klein":
+            options.update(mode=flux_mode, inpaint_strength=float(flux_inpaint_strength),
+                           cfg=float(flux_cfg))
+        else:
+            options.update(cfg=float(pix_text_cfg), image_cfg=float(pix_image_cfg), mode="base")
+        def on_progress(done, total, event):
+            progress((done, total), desc=f"Epoch {event['epoch']} | image loss {event['loss']:.5f}")
+        result = trainer.fit(location, options=options, progress=on_progress)
+        weights = sorted(zip(result.head_labels, result.weights), key=lambda x: x[1], reverse=True)
+        top = ", ".join(f"{name}: {weight:.3f}" for name, weight in weights[:3])
+        return result.checkpoint, (
+            f"Training completed: {len(result.history)} examples processed. "
+            f"Last image loss: {result.history[-1]['loss']:.5f}. "
+            f"Saved: {result.checkpoint}. Top heads: {top}"
+        )
+    except (ValueError, RuntimeError, TypeError, KeyError, ImportError, OSError) as error:
+        raise gr.Error(f"Head-weight training failed: {error}") from error
 
 
 def build_demo():
@@ -457,10 +530,14 @@ def build_demo():
                 refresh_heads = gr.Button("Load available layers / heads")
                 attention_info = gr.Markdown("Load attention choices after selecting a backend.")
             selected_layers = gr.CheckboxGroup(label="Guidance attention layers", choices=[])
-            head_mode = gr.Radio(["Uniform", "Adaptive", "Manual"], value="Uniform", label="Head policy")
+            selected_heads = gr.CheckboxGroup(
+                label="Include specific heads (optional)", choices=[],
+                info="Empty = all heads from checked layers. Applies to Uniform, Adaptive and Learned."
+            )
+            head_mode = gr.Radio(["Uniform", "Adaptive", "Manual", "Learned"], value="Uniform", label="Head policy")
             manual_group = gr.Group(visible=False)
             with manual_group:
-                manual_heads = gr.CheckboxGroup(label="Manual head selection", choices=[])
+                gr.Markdown("Select heads above, then edit the weight values below.")
                 manual_rows = gr.Dataframe(
                     headers=["head", "weight"],
                     datatype=["str", "number"],
@@ -475,6 +552,34 @@ def build_demo():
                     adaptive_temperature = gr.Number(value=0.01, label="temperature")
                     adaptive_ema = gr.Number(value=0.5, label="ema")
                     adaptive_mix = gr.Number(value=0.1, label="uniform mix")
+            learned_group = gr.Group(visible=False)
+            with learned_group:
+                gr.Markdown("### Trainable head weights (higher-order gradients)")
+                learned_checkpoint = gr.Textbox(
+                    value="outputs/learned_heads.json", label="Weights checkpoint (JSON)",
+                    info="Train using the controls below, or enter an existing checkpoint for inference."
+                )
+                with gr.Row():
+                    dataset_file = gr.File(label="Upload dataset ZIP (manifest.json + images)",
+                                           file_types=[".zip"], type="filepath")
+                    dataset_path = gr.Textbox(label="Or dataset folder / manifest.json on server", value="")
+                with gr.Row():
+                    learned_temperature = gr.Number(value=1.0, label="Learned softmax temperature")
+                    training_epochs = gr.Number(value=1, precision=0, label="Epochs")
+                    learning_rate = gr.Number(value=0.001, label="Learning rate")
+                    optimizer_name = gr.Dropdown(["adamw", "adam", "sgd"], value="adamw", label="Optimizer")
+                    weight_decay = gr.Number(value=0.0, label="Weight decay")
+                with gr.Row():
+                    image_loss_name = gr.Dropdown(["l1", "mse", "charbonnier", "smooth_l1"], value="l1", label="Image pixel loss")
+                    inside_weight = gr.Number(value=1.0, label="Edit-region weight")
+                    outside_weight = gr.Number(value=1.0, label="Preservation weight")
+                    lpips_weight = gr.Number(value=0.0, label="Global LPIPS weight (optional)")
+                    grad_clip = gr.Number(value=1.0, label="Gradient clipping norm")
+                gr.Markdown("**Note:** Training backpropagates through every denoising step and each guidance gradient. "
+                            "Start with 4 denoising steps, 1–2 guided steps, and 128–256px images; "
+                            "larger settings can exceed GPU memory.")
+                train_button = gr.Button("Train head weights", variant="secondary")
+                train_status = gr.Textbox(label="Training status", interactive=False)
 
         with gr.Accordion("Propagation", open=False):
             use_propagation = gr.Checkbox(value=False, label="Enable affinity-based propagation")
@@ -502,12 +607,25 @@ def build_demo():
         model.change(update_model_panels, [model], [flux_group, pix_group])
         refresh_heads.click(
             refresh_attention_choices,
-            [model, selected_layers, manual_heads],
-            [attention_catalog, selected_layers, propagation_layers, manual_heads, manual_rows, attention_info],
+            [model, selected_layers, selected_heads],
+            [attention_catalog, selected_layers, propagation_layers, selected_heads, manual_rows, attention_info],
         )
-        selected_layers.change(update_heads_from_layers, [attention_catalog, selected_layers, manual_heads], [manual_heads, manual_rows, attention_info])
-        manual_heads.change(update_manual_weight_table, [manual_heads], [manual_rows])
-        head_mode.change(update_head_mode, [head_mode], [manual_group, adaptive_group])
+        selected_layers.change(update_heads_from_layers, [attention_catalog, selected_layers, selected_heads], [selected_heads, manual_rows, attention_info])
+        selected_heads.change(update_manual_weight_table, [selected_heads], [manual_rows])
+        head_mode.change(update_head_mode, [head_mode], [manual_group, adaptive_group, learned_group])
+        train_button.click(
+            train_heads,
+            [dataset_file, dataset_path, model, selected_losses,
+             coverage_w, focal_w, moment_w, centerline_w, centroid_w, outside_w,
+             steps, guide_steps, strength, seed, max_side,
+             flux_mode, flux_inpaint_strength, flux_cfg, pix_text_cfg, pix_image_cfg,
+             selected_layers, selected_heads, learned_temperature,
+             use_propagation, propagation_layers, propagation_start, propagation_stop,
+             propagation_limit, propagation_threshold, propagation_max_fraction,
+             training_epochs, learning_rate, optimizer_name, weight_decay, image_loss_name,
+             inside_weight, outside_weight, lpips_weight, grad_clip, learned_checkpoint],
+            [learned_checkpoint, train_status], concurrency_limit=1,
+        )
 
         submit.click(
             run,
@@ -516,7 +634,8 @@ def build_demo():
              model, steps, guide_steps, strength, seed, max_side,
              flux_mode, flux_inpaint_strength, flux_cfg,
              pix_text_cfg, pix_image_cfg,
-             head_mode, selected_layers, manual_rows, adaptive_temperature, adaptive_ema, adaptive_mix,
+             head_mode, selected_layers, selected_heads, manual_rows, adaptive_temperature, adaptive_ema, adaptive_mix,
+        learned_checkpoint,
              use_propagation, propagation_layers, propagation_start, propagation_stop, propagation_limit,
              propagation_threshold, propagation_max_fraction,
              save_maps],
