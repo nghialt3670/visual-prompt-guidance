@@ -8,3 +8,4 @@ outputs/
 *.pyc
 configs/ui_settings.json
 configs/ui_settings.json.*.tmp
+data/

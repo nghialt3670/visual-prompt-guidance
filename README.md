@@ -370,3 +370,68 @@ uv run --extra pix2pix python examples/train_heads.py \
 To use a particular location, specify `--output-dir outputs/train/my_experiment`.
 The legacy `--output checkpoint.json` option is retained for existing scripts;
 it writes the other training artifacts next to the specified checkpoint.
+
+
+## Small CompBench local-edit dataset sampler (v0.5.1)
+
+`examples/prepare_compbench.py` randomly samples source/ground-truth image pairs from
+[BohanJia/CompBench](https://huggingface.co/datasets/BohanJia/CompBench)
+(CVPR 2026, dataset license CC BY 4.0) for **add**, **remove**, and **replace**.
+It uses Hugging Face's **dataset-viewer `/filter` API** to request individual
+rows and their images, instead of downloading the approximately 3.8 GB full
+Parquet dataset. Internet access and a working dataset viewer are required.
+
+```bash
+uv run --extra dataset python examples/prepare_compbench.py \
+  --per-task 5 --seed 42 --out data/compbench-vpg
+```
+
+For each selected pair, the script exports **three training entries** (same
+input/output/mask, but point, box, or scribble target). The annotation rules:
+
+- Point = object-mask centroid snapped to a foreground pixel.
+- Box = tight bounding rectangle of the largest mask component.
+- Scribble = skeletonize the largest component using scikit-image, extract
+  an approximate longest centerline using weighted graph search, and resample
+  evenly spaced points along its length. Stored as an ordered **path**.
+- Edit mask = the original dataset binary edit-region mask for image loss.
+
+```text
+data/compbench-vpg/
+  manifest.json                    # all three tasks combined; valid trainer input
+  download_report.json             # source IDs and skip reasons
+  add/
+    manifest.json                  # add only; valid trainer input
+    images/*_input.png, *_target.png
+    masks/*_edit.png, *_region.png
+    previews/*.png                 # verify point, box, scribble visually
+  remove/
+    manifest.json
+    images/ ...
+    masks/ ...
+    previews/ ...
+  replace/
+    manifest.json
+    images/ ...
+    masks/ ...
+    previews/ ...
+```
+
+Run training by task:
+
+```bash
+uv run --extra pix2pix python examples/train_heads.py \
+  --backend pix2pix --dataset data/compbench-vpg/add \
+  --steps 4 --guided-steps 1 --max-side 128 --epochs 2
+```
+
+**Check the generated `manifest.json` and preview PNGs before training.**
+CompBench's mask is documented as the *edit region*, which may not be a clean
+object silhouette in every example; generated centerlines are approximate.
+The `object_phrase` is heuristically extracted from the original instruction
+and may need manual correction. Rows for which no phrase is detected are skipped
+and reported. In removal tasks the phrase refers to the object being removed;
+in replacement tasks the script tries to select the new object after "with".
+Treat this as dataset preparation, not validated supervision quality. Multiple
+visual variants of one source/target pair must stay in the same train/validation
+split to prevent leakage.
