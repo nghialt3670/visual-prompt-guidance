@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "active": "generate",
+  "generate": {
+    "model": "InstructPix2Pix",
+    "head_mode": "Uniform"
+  },
+  "train": {
+    "model": "InstructPix2Pix",
+    "dataset_path": "",
+    "head_mode": "Learned"
+  }
+}

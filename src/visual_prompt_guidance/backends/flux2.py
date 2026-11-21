@@ -50,6 +50,11 @@ class Flux2Klein:
         self._pipe = None
         self._loaded_mode = None
 
+    def attention_catalog(self) -> dict:
+        """Describe head IDs using only the tiny transformer/config.json file."""
+        from .attention_catalog import component_config, flux_catalog
+        return flux_catalog(component_config(self.model_id, 'transformer'))
+
     def _load(self, mode: str):
         from diffusers import Flux2KleinPipeline, Flux2KleinInpaintPipeline
         device = self.device
@@ -69,6 +74,7 @@ class Flux2Klein:
         pipe.transformer.eval().requires_grad_(False)
         pipe.vae.eval().requires_grad_(False)
         self._pipe, self._loaded_mode = pipe,mode
+        return pipe
 
     @staticmethod
     def _get(request: Request):

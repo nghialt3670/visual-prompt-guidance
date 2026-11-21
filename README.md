@@ -1,6 +1,50 @@
-# Visual Prompt Guidance 0.6.0
+# Visual Prompt Guidance 0.7.0
 
 A **small composable framework** for training-free, latent-gradient guidance using spatial attention. A complete rewrite of the public API: the framework is not a FLUX.2 application disguised as a library.
+
+## Dedicated inference and training applications (v0.7.0)
+
+The monolithic Gradio app was split into two independent entry points:
+
+```bash
+# Inference/editor, with learned-checkpoint loading
+uv run --extra all python examples/ui_inference.py --host 0.0.0.0 --port 7861
+
+# Training, with per-sample live loss, gradient norm and head-weight plots
+uv run --extra all python examples/ui_training.py --host 0.0.0.0 --port 7862
+```
+
+`examples/gradio_app.py` is a backwards-compatible alias for **Inference only**.
+Both applications share `configs/project.json` (`--config` or `VPG_CONFIG`) and the
+same application-level widgets in `examples/ui_common.py`, but maintain **separate
+Generate and Train profiles**. Normal CLI commands use the exact same profiles.
+
+In **Inference**, select **Learned** in Head policy, choose a checkpoint from
+`outputs/train/*/learned_heads.json`, and click **Load selected checkpoint**. It
+restores the checkpoint's head identities and layer order automatically. In
+**Training**, select a dataset, optimizer, image loss and heads and click **Train
+head weights**. Live charts update *after every training sample*, not after
+every denoising step. A completed run creates `history.json`, `loss_curve.png`,
+`head_weights.csv` and `learned_heads.json` in `outputs/train/<timestamp>/`.
+
+**Attention catalog fix:** FLUX.2's former UI code used `_load('base')` as if it
+returned a pipeline; it actually returned `None`. The new attention selector
+calls `backend.attention_catalog()`, which reads **only** the component's small
+`config.json` rather than loading model weights. FLUX head counts are derived
+from its transformer config; InstructPix2Pix instantiates a weightless U-Net
+on the PyTorch `meta` device from the UNet config to discover exact module
+names. This may fetch a tiny JSON config once, not a checkpoint.
+
+The inference/training CLI scripts remain:
+
+```bash
+uv run --extra flux2 python examples/train_heads.py --backend flux2 \
+  --dataset data/compbench-vpg/add/manifest_scribble.json
+
+uv run --extra flux2 python examples/generate.py --backend flux2 \
+  --dataset data/compbench-vpg/add/manifest_scribble.json \
+  --checkpoint outputs/train/YOUR_RUN/learned_heads.json
+```
 
 ## Shared CLI / Gradio configuration (v0.6.0)
 
@@ -9,7 +53,7 @@ All default values live in `src/visual_prompt_guidance/config.py`. CLI, Gradio a
 
 ```bash
 # Start UI with the same settings file that scripts read
-uv run --extra ui --extra pix2pix python examples/gradio_app.py --config configs/project.json
+uv run --extra ui --extra pix2pix python examples/ui_inference.py --config configs/project.json
 
 # Train using train profile; explicit arguments override it for this run only
 uv run --extra pix2pix python examples/train_heads.py \
@@ -32,7 +76,7 @@ uv run --extra pix2pix python examples/generate.py \
 
 With a standalone source image, use `examples/generate.py --image input.png --prompt "Add a dog" --object dog --point 100 150`, or `--box x0 y0 x1 y1`, `--scribble-mask mask.png`, or `--scribble-path path.json`. The legacy `examples/instruct_pix2pix.py` is now a wrapper around the same Generate CLI.
 
-The Gradio UI has Save/Load per-profile controls and **Use trained weights for Generate** after training. Saved weights are referenced by `learned_checkpoint`; inference loads them with `Learned.load`, restoring the *exact trained attention layer order* and rejecting incompatible explicit selections. To avoid confusing comparisons, match the guidance loss, strengths, and denoising schedule of training when applying weights at inference.
+Each dedicated UI saves/restores its own profile. Inference offers **Load selected checkpoint** for trained weights. Saved weights are referenced by `learned_checkpoint`; inference loads them with `Learned.load`, restoring the *exact trained attention layer order* and rejecting incompatible explicit selections. To avoid confusing comparisons, match the guidance loss, strengths, and denoising schedule of training when applying weights at inference.
 
 The app will read existing `configs/ui_settings.json` from v0.5.x if the canonical file does not exist, then write `configs/project.json` at the next save. Uploaded images and ZIP bytes are not persisted as profile settings. Run folders still contain the effective `config.json` snapshot.
 
@@ -70,7 +114,7 @@ Observers are optional. The **engine has no prompt names, no loss names, no netw
 
 ```bash
 uv sync --extra all
-uv run --extra all python examples/gradio_app.py --host 0.0.0.0 --port 7861
+uv run --extra all python examples/ui_inference.py --host 0.0.0.0 --port 7861
 ```
 
 Without FLUX/UI dependencies:
@@ -163,7 +207,10 @@ src/visual_prompt_guidance/
     flux2_attention.py   # only FLUX2-specific Q/K hooks
 examples/
   python_api.py          # host app using the public API
-  gradio_app.py          # optional UI (not imported by framework)
+  ui_common.py           # shared widget/metadata support
+  ui_inference.py        # inference-only Gradio app
+  ui_training.py         # training-only Gradio app with live plots
+  gradio_app.py          # compatibility launcher for inference
 tests/
   test_framework.py      # mock-backend end-to-end tests
 ```
@@ -190,7 +237,7 @@ Install only the InstructPix2Pix + UI extras:
 
 ```bash
 uv sync --extra pix2pix --extra ui
-uv run --extra pix2pix --extra ui python examples/gradio_app.py --host 0.0.0.0 --port 7861
+uv run --extra pix2pix --extra ui python examples/ui_inference.py --host 0.0.0.0 --port 7861
 ```
 
 Select **InstructPix2Pix** in the `Model backend` dropdown. Upload your image,
@@ -304,7 +351,7 @@ the outside-region pixel loss.
 
 ### UI
 
-Launch `examples/gradio_app.py` and choose **Learned** under **Attention heads**.
+Launch `examples/ui_training.py` to train weights. Then launch `examples/ui_inference.py`, choose **Learned** under Head policy, and load the saved checkpoint.
 Optionally select layers and individual heads using checkboxes. Under the
 **Trainable head weights** panel, upload the ZIP or supply a dataset directory,
 select an outer image loss (`l1`, `mse`, `charbonnier`, or `smooth_l1`), set the

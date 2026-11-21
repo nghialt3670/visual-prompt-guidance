@@ -51,6 +51,11 @@ class InstructPix2Pix:
         self.cpu_offload = cpu_offload
         self._pipe = pipeline
 
+    def attention_catalog(self) -> dict:
+        """Describe head IDs without loading the checkpoint or pipeline."""
+        from .attention_catalog import component_config, pix2pix_catalog
+        return pix2pix_catalog(component_config(self.model_id, 'unet'))
+
     def _load(self):
         if self._pipe is not None:
             return self._pipe
