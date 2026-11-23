@@ -134,7 +134,8 @@ class InstructPix2Pix:
         pipe.unet.eval().requires_grad_(False)
         device = pipe._execution_device
         generator = torch.Generator(device="cpu").manual_seed(int(opts.get("seed", 42)))
-        tokens = object_tokens(pipe.tokenizer, prompt, phrase)
+        tokens = (() if opts.get("skip_attention_tokens", False) else
+                  object_tokens(pipe.tokenizer, prompt, phrase))
         with torch.no_grad():
             # Official InstructPix2Pix `_encode_prompt` emits embeddings in
             # [positive, negative+image, negative-no-image] batch order.

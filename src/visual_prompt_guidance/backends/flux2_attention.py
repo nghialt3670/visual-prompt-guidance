@@ -25,6 +25,7 @@ class AttentionCollector:
         query_chunk: int = 64,
         self_blocks: list[str] | None = None,
         capture_heads: bool = False,
+        checkpoint_chunks: bool = False,
     ):
         self.transformer = transformer
         self.tokens = target_text_tokens
@@ -33,6 +34,7 @@ class AttentionCollector:
         self.self_blocks = self_blocks or []
         self.query_chunk = query_chunk
         self.capture_heads = capture_heads
+        self.checkpoint_chunks = checkpoint_chunks
         self.maps: dict[str, torch.Tensor] = {}
         self.head_maps: dict[str, torch.Tensor] = {}
         self.self_maps: dict[str, torch.Tensor] = {}
@@ -99,14 +101,24 @@ class AttentionCollector:
             k_all = k.transpose(1, 2).float()  # [B,H,Lkeys,D]
             q_cross = q_cross.transpose(1, 2).float()  # [B,H,Lout,D]
             inds = torch.tensor(self.tokens, device=q_cross.device, dtype=torch.long)
-            chunks = []
-            for pos in range(0, q_cross.shape[2], self.query_chunk):
-                logits = (q_cross[:, :, pos : pos + self.query_chunk] @ k_all.transpose(-1, -2)) / math.sqrt(head_dim)
+            def probability_mass(q_piece: torch.Tensor, all_keys: torch.Tensor) -> torch.Tensor:
+                # Exactly the same softmax mass as the original implementation.
+                # Recompute each QK/logsumexp chunk during higher-order backward
+                # instead of retaining the large [B,H,query_chunk,all_keys] logits.
+                logits = (q_piece @ all_keys.transpose(-1, -2)) / math.sqrt(head_dim)
                 numer = logits.index_select(-1, inds).logsumexp(dim=-1)
                 denom = logits.logsumexp(dim=-1)
-                # Retain [B,head,spatial_query] only in adaptive mode.
-                # The ordinary, low-memory path still averages over heads.
-                probabilities = torch.exp(numer - denom)
+                return torch.exp(numer - denom)
+
+            chunks = []
+            for pos in range(0, q_cross.shape[2], self.query_chunk):
+                q_piece = q_cross[:, :, pos:pos + self.query_chunk]
+                if self.checkpoint_chunks and torch.is_grad_enabled() and q_piece.requires_grad:
+                    from torch.utils.checkpoint import checkpoint
+                    probabilities = checkpoint(probability_mass, q_piece, k_all,
+                                               use_reentrant=False)
+                else:
+                    probabilities = probability_mass(q_piece, k_all)
                 chunks.append(probabilities if self.capture_heads else probabilities.mean(dim=1))
             if self.capture_heads:
                 per_head = torch.cat(chunks, dim=2)

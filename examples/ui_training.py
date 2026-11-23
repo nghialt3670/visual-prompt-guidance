@@ -118,9 +118,11 @@ def train_stream(dataset_file, *values, panel: Panel):
                     'head_entropy': entropy,
                     'epoch': event['epoch'],
                 }
+                gpu_note = (f" CUDA peak={event['cuda_peak_allocated_gib']:.2f} GiB"
+                            if 'cuda_peak_allocated_gib' in event else '')
                 print(f"[VPG training] Update {count}/{total}: "
                       f"loss={payload['loss']:.6f} grad={payload['grad_norm']:.5g} "
-                      f"max_weight={peak:.4f}", flush=True)
+                      f"max_weight={peak:.4f}{gpu_note}", flush=True)
                 with log_file.open('a', encoding='utf-8') as handle:
                     handle.write(f"Update {count}/{total}: loss={payload['loss']:.6f} "
                                  f"grad={payload['grad_norm']:.5g} max_weight={peak:.4f}\n")
@@ -210,6 +212,16 @@ def build_demo():
                     value=init['background_loss_name'],label='Background loss')
                 train_components['background_loss_weight']=gr.Number(value=init['background_loss_weight'],label='Background weight')
                 train_components['grad_clip']=gr.Number(value=init['grad_clip'],label='Gradient clipping')
+            with gr.Accordion('FLUX memory optimization (exact gradients)', open=False):
+                with gr.Row():
+                    train_components['train_checkpoint_transformer'] = gr.Checkbox(
+                        value=init['train_checkpoint_transformer'], label='Checkpoint transformer')
+                    train_components['train_checkpoint_attention'] = gr.Checkbox(
+                        value=init['train_checkpoint_attention'], label='Checkpoint attention chunks')
+                    train_components['train_checkpoint_vae'] = gr.Checkbox(
+                        value=init['train_checkpoint_vae'], label='Checkpoint VAE decoder')
+                    train_components['train_query_chunk'] = gr.Number(
+                        value=init['train_query_chunk'], precision=0, label='Query chunk size')
         panel=Panel('train',training=True)
         panel.add('dataset_path',dataset_path)
         for key,comp in train_components.items():

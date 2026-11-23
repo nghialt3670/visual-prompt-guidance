@@ -1,6 +1,26 @@
-# Visual Prompt Guidance 0.8.3
+# Visual Prompt Guidance 0.8.7
 
 A **small composable framework** for training-free, latent-gradient guidance using spatial attention. A complete rewrite of the public API: the framework is not a FLUX.2 application disguised as a library.
+
+## Inference modes and canvas cleanup (v0.8.7)
+
+The Inference UI has two saved modes in `generate.inference_mode`:
+
+- **Standard (no guidance):** plain image upload + instruction. Runs the
+  backend's ordinary denoising/CFG/scheduler without attention capture,
+  spatial objectives, latent guidance, propagation, or learned-head checkpoint.
+  No scribble, point, or box is required. FLUX native inpaint mode uses a
+  full-image edit mask when no spatial prompt is supplied.
+- **Visual guidance:** draw a scribble, point, or box and configure attention
+  guidance normally. A single **Clear annotations** button resets *all*
+  visual prompt types without deleting the input source image.
+
+Switching modes copies the source image to the appropriate input component;
+any existing annotation is not passed to Standard mode. Both input and output
+panels use matching 500px-height image components in a dedicated image row,
+with visual prompt controls placed underneath so they cannot stretch output.
+The mode is saved in `configs/project.json`, and training configuration is
+unaffected.
 
 ## Training UI responsiveness (v0.8.3)
 
@@ -588,3 +608,57 @@ or pass `--detect-anomaly` to `examples/train_heads.py`. PyTorch then reports
 the first autograd operation that emits NaN gradients, with its forward stack
 trace. This is slower, so leave it disabled for normal training. The trainer
 continues to refuse optimizer steps on non-finite gradients (no silent fixes).
+
+## Memory-efficient FLUX head training (v0.8.8)
+
+The **Training UI** automatically enables three *exact-gradient* memory
+optimizations for FLUX.2 Klein; they are also part of the shared
+`configs/project.json` **train** profile and apply to CLI training. They do
+not alter inference or the training objective:
+
+- `train_checkpoint_transformer`: non-reentrant activation checkpoint of the
+  native FLUX transformer, explicitly returning captured attention maps.
+- `train_checkpoint_attention`: recompute per-chunk QK/logsumexp attention mass
+  rather than retaining intermediate attention logits for every block.
+- `train_checkpoint_vae`: recompute VAE decoder activations in image-loss backward.
+- `train_query_chunk`: attention query chunk width (default `16`).
+
+The inner guidance forward still uses math SDPA for second-order derivatives,
+but *normal denoising* may use PyTorch's default fused SDPA. The complete
+denoising graph remains differentiable: **no detach, truncated BPTT, removal
+of layers, or approximation of head contributions** is introduced.
+Recomputation makes training slower in exchange for reduced retained memory.
+
+Example:
+
+```bash
+uv run --extra flux2 python examples/train_heads.py \
+  --backend flux2 --dataset data/compbench-vpg/add/manifest_scribble.json \
+  --device cuda --dtype bf16 --max-side 512 \
+  --steps 3 --guided-steps 1 --text-cfg 1 --epochs 1 \
+  --layer D2 --head D2:H00 --head D2:H01 --no-propagation
+```
+
+To compare with the old behavior, pass all three flags
+`--no-transformer-checkpoint --no-attention-checkpoint --no-vae-checkpoint`.
+When CUDA is available, each optimizer update logs peak allocated/reserved GiB.
+
+**Validation limits:** CPU equivalence tests compare inner attention guidance,
+full multi-step differentiable denoising and learned-logit gradients against
+the uncheckpointed path. Full FLUX.2 GPU memory and numerical behavior must
+still be checked on the target CUDA environment; the optimizations do not
+guarantee a particular resolution or number of steps will fit.
+
+To train **all 600 FLUX heads**, select all 25 layers and explicitly clear a
+previously saved head filter with `--all-heads`:
+
+```bash
+layers=(); for layer in D{0..4} S{0..19}; do layers+=(--layer "$layer"); done
+uv run --extra flux2 python examples/train_heads.py \
+  --backend flux2 --dataset data/compbench-vpg/add/manifest_scribble.json \
+  --device cuda --dtype bf16 --max-side 512 --steps 3 --guided-steps 1 \
+  --text-cfg 1 --epochs 1 --no-propagation --all-heads "${layers[@]}"
+```
+
+This is a **memory feasibility test**, not a guarantee that all 600 heads fit
+on a 96 GB GPU.

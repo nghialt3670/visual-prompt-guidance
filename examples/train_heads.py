@@ -29,6 +29,8 @@ def make_parser():
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--layer", action="append", default=None)
     p.add_argument("--head", action="append", default=None)
+    p.add_argument("--all-heads", action="store_true",
+                   help="Clear any saved head filter and train all heads in the selected layers")
     p.add_argument("--guidance-loss", action="append", choices=list(losses.BUILTIN_LOSSES), default=None,
                    help="Repeat for multiple guidance losses; weights default from shared config")
     p.add_argument("--guidance-loss-weight", type=float, default=None,
@@ -37,6 +39,17 @@ def make_parser():
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--optimizer", choices=["adamw", "adam", "sgd"], default=None)
     p.add_argument("--grad-clip", type=float, default=None)
+    p.add_argument("--no-transformer-checkpoint", action="store_false",
+                   dest="train_checkpoint_transformer", default=None,
+                   help="Disable FLUX recomputation of transformer activations")
+    p.add_argument("--no-attention-checkpoint", action="store_false",
+                   dest="train_checkpoint_attention", default=None,
+                   help="Disable FLUX recomputation of attention-probability chunks")
+    p.add_argument("--no-vae-checkpoint", action="store_false",
+                   dest="train_checkpoint_vae", default=None,
+                   help="Disable FLUX VAE decoder checkpointing")
+    p.add_argument("--attention-query-chunk", type=int, default=None,
+                   help="Number of output-image queries per differentiable attention chunk")
     p.add_argument("--weight-decay", type=float, default=None)
     p.add_argument("--edit-loss", choices=["l1", "mse", "charbonnier", "smooth_l1", "lpips"], default=None)
     p.add_argument("--edit-weight", type=float, default=None)
@@ -60,6 +73,8 @@ def make_parser():
 
 
 def settings_from_args(args):
+    if args.all_heads and args.head:
+        raise ValueError("Choose either --all-heads or --head, not both")
     direct = {
         "dataset": "dataset_path", "device": "device", "dtype": "dtype", "model_id": "model_id",
         "steps": "steps", "guided_steps": "guide_steps", "strength": "strength",
@@ -67,6 +82,10 @@ def settings_from_args(args):
         "head": "selected_heads", "guidance_loss": "selected_losses",
         "epochs": "training_epochs", "lr": "learning_rate", "optimizer": "optimizer_name",
         "grad_clip": "grad_clip", "weight_decay": "weight_decay",
+        "train_checkpoint_transformer": "train_checkpoint_transformer",
+        "train_checkpoint_attention": "train_checkpoint_attention",
+        "train_checkpoint_vae": "train_checkpoint_vae",
+        "attention_query_chunk": "train_query_chunk",
         "edit_loss": "edit_loss_name", "edit_weight": "edit_loss_weight",
         "background_loss": "background_loss_name", "background_weight": "background_loss_weight",
         "temperature": "learned_temperature",
@@ -79,6 +98,8 @@ def settings_from_args(args):
     }
     overrides = {dest: getattr(args, source) for source, dest in direct.items()
                  if getattr(args, source) is not None}
+    if args.all_heads:
+        overrides['selected_heads'] = []
     if args.backend:
         overrides["model"] = canonical_model(args.backend)
     model = overrides.get("model") or resolve_settings("train", path=args.config)["model"]
@@ -128,7 +149,9 @@ def main(argv=None):
                              "settings": settings, "dataset": dataset, "model_options": options,
                              "train_config": vars(train_cfg), "image_loss": vars(image_cfg)})
     result = trainer.fit(dataset, options=options, progress=lambda n, total, event: print(
-        f"{n}/{total} image loss={event['loss']:.6f} grad={event['grad_norm']:.5g}", flush=True))
+        f"{n}/{total} image loss={event['loss']:.6f} grad={event['grad_norm']:.5g}" +
+        (f" CUDA peak={event['cuda_peak_allocated_gib']:.2f} GiB"
+         if 'cuda_peak_allocated_gib' in event else ''), flush=True))
     save_training_reports(folder, result.history, result.head_labels, result.weights)
     print(f"Saved training run to {folder} ({len(result.weights)} heads)")
     print(f"For inference: set generate.head_mode=Learned and generate.learned_checkpoint={checkpoint}")

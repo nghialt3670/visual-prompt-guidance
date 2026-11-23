@@ -119,8 +119,12 @@ class ImageLossConfig:
     edit_weight: float = 1.0
     background_loss: str = "l1"
     background_weight: float = 1.0
+    pixel: str | None = None  # Deprecated alias for both region losses.
 
     def __post_init__(self):
+        if self.pixel is not None:
+            object.__setattr__(self, 'edit_loss', self.pixel)
+            object.__setattr__(self, 'background_loss', self.pixel)
         for name in (self.edit_loss, self.background_loss):
             if name not in IMAGE_LOSS_REGISTRY:
                 raise ValueError(f"Unknown image loss {name!r}")
@@ -350,6 +354,8 @@ class HeadTrainer:
                     example = dataset[sample_index]
                     if stage is not None:
                         stage(f"Sample {len(history) + 1}/{total_items}: preparing model and denoising")
+                    if torch.cuda.is_available():
+                        torch.cuda.reset_peak_memory_stats()
                     # Anomaly mode must cover forward *and* backward to provide
                     # the forward traceback of the first NaN-producing op.
                     # Off by default: autograd anomaly detection is expensive.
@@ -393,6 +399,16 @@ class HeadTrainer:
                     record = {"epoch": epoch + 1, "sample": sample_index,
                               "loss": float(image_loss.detach()), "grad_norm": gradient_norm,
                               **parts}
+                    if policy.logits.is_cuda:
+                        gpu = policy.logits.device
+                        record['cuda_peak_allocated_gib'] = round(
+                            torch.cuda.max_memory_allocated(gpu) / (1024 ** 3), 3)
+                        record['cuda_peak_reserved_gib'] = round(
+                            torch.cuda.max_memory_reserved(gpu) / (1024 ** 3), 3)
+                        if stage is not None:
+                            stage(f"CUDA peak (sample {len(history) + 1}/{total_items}): "
+                                  f"allocated {record['cuda_peak_allocated_gib']:.2f} GiB, "
+                                  f"reserved {record['cuda_peak_reserved_gib']:.2f} GiB")
                     history.append(record)
                     if progress is not None:
                         progress(len(history), total_items, record)

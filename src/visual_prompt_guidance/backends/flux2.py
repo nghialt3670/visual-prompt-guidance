@@ -49,6 +49,11 @@ class Flux2Klein:
         self.model_id, self.device, self.dtype, self.cpu_offload = model_id, device, dtype, cpu_offload
         self._pipe = None
         self._loaded_mode = None
+        # Training-only, exact-gradient memory saving. Never enabled for ordinary inference.
+        self.train_checkpoint_transformer = False
+        self.train_checkpoint_attention = False
+        self.train_checkpoint_vae = False
+        self.train_query_chunk = 64
 
     def attention_catalog(self) -> dict:
         """Describe head IDs using only the tiny transformer/config.json file."""
@@ -128,7 +133,8 @@ class Flux2Klein:
                 neg_embeds,neg_ids=pipe.encode_prompt(
                     prompt="",device=device,num_images_per_prompt=1,
                     max_sequence_length=token_limit,text_encoder_out_layers=(9,18,27))
-            tokens=find_object_token_indices(pipe.tokenizer,prompt,phrase,max_length=token_limit)
+            tokens=([] if opts.get("skip_attention_tokens", False) else
+                    find_object_token_indices(pipe.tokenizer,prompt,phrase,max_length=token_limit))
             processed=pipe.image_processor.preprocess(image,height=h,width=w,resize_mode="crop")
             seq_len=gh*gw
             sigmas=np.linspace(1.,1./num_steps,num_steps)
@@ -174,51 +180,105 @@ class Flux2Klein:
     def set_latent(self,state: _KleinState,latent: torch.Tensor) -> None:
         state.latent_data=latent
 
-    def _predict(self,state: _KleinState, step: torch.Tensor, conditional: bool) -> torch.Tensor:
-        pipe=self._pipe
-        latents=state.latent_data.to(dtype=pipe.transformer.dtype)
-        hidden=torch.cat([latents,state.reference.to(dtype=latents.dtype)],dim=1)
-        ids=torch.cat([state.latent_ids,state.reference_ids],dim=1)
-        embeds=state.prompt_embeds if conditional else state.negative_embeds
-        text_ids=state.text_ids if conditional else state.negative_ids
-        with pipe.transformer.cache_context("cond" if conditional else "uncond"):
-            pred=pipe.transformer(
-                hidden_states=hidden,timestep=step.expand(latents.shape[0]).to(latents.dtype)/1000,
-                guidance=None,encoder_hidden_states=embeds,txt_ids=text_ids,
-                img_ids=ids,joint_attention_kwargs=None,return_dict=False)[0]
-        return pred[:,:state.latent_data.shape[1]]
+    def _predict(self, state: _KleinState, step: torch.Tensor,
+                 conditional: bool, attention: AttentionRequest | None = None
+                 ) -> tuple[torch.Tensor, AttentionBatch | None]:
+        """Run the native FLUX transformer, optionally returning its exact head maps.
 
-    def forward(self,state: _KleinState,step: torch.Tensor,*,attention: AttentionRequest | None) -> Prediction:
-        pipe=self._pipe
-        batch=None
-        if attention is None:
-            conditional_pred=self._predict(state,step,True)
+        When checkpointing, attention maps MUST be explicit checkpoint outputs;
+        mutating hook-owned dictionaries would retain graphs and break recomputation.
+        All step-dependent inputs are snapshotted outside `model_forward`, so a
+        later backward never observes a mutated denoising state.
+        """
+        pipe = self._pipe
+        latents = state.latent_data.to(dtype=pipe.transformer.dtype)
+        n_output = latents.shape[1]
+        hidden = torch.cat([latents, state.reference.to(dtype=latents.dtype)], dim=1)
+        ids = torch.cat([state.latent_ids, state.reference_ids], dim=1)
+        embeds = state.prompt_embeds if conditional else state.negative_embeds
+        text_ids = state.text_ids if conditional else state.negative_ids
+        timestep = step.expand(latents.shape[0]).to(latents.dtype) / 1000
+        cfg_label = 'cond' if conditional else 'uncond'
+        blocks = (list(attention.layers) if attention is not None and attention.layers else
+                  [f'D{i}' for i in range(len(pipe.transformer.transformer_blocks))])
+        self_blocks = (list(attention.affinity_layers or blocks)
+                       if attention is not None and attention.need_affinity else [])
+        require_affinity = bool(attention is not None and attention.need_affinity)
+        tokens = list(state.token_indices)
+        text_len = embeds.shape[1]
+        grid = state.grid
+        chunk = int(self.train_query_chunk if self.train_checkpoint_attention else
+                    getattr(self, 'query_chunk', 64))
+        if chunk < 1:
+            raise ValueError('Attention query chunk size must be positive')
+
+        def model_forward(model_input):
+            collector = None
+            if attention is not None:
+                collector = AttentionCollector(
+                    pipe.transformer, tokens, n_output, blocks, query_chunk=chunk,
+                    self_blocks=self_blocks, capture_heads=True,
+                    checkpoint_chunks=self.train_checkpoint_attention,
+                )
+            from contextlib import nullcontext
+            hooks = (collector.capture(text_len=text_len, capture_self=require_affinity)
+                     if collector is not None else nullcontext())
+            with hooks:
+                with pipe.transformer.cache_context(cfg_label):
+                    pred = pipe.transformer(
+                        hidden_states=model_input, timestep=timestep, guidance=None,
+                        encoder_hidden_states=embeds, txt_ids=text_ids, img_ids=ids,
+                        joint_attention_kwargs=None, return_dict=False,
+                    )[0]
+            pred = pred[:, :n_output]
+            if collector is None:
+                return pred
+            raw_heads = collector.heads_tensor()
+            heads = raw_heads.reshape(raw_heads.shape[0], raw_heads.shape[1], *grid)
+            if require_affinity:
+                return pred, heads, collector.mean_self_map()
+            return pred, heads
+
+        if self.train_checkpoint_transformer and torch.is_grad_enabled() and hidden.requires_grad:
+            from torch.utils.checkpoint import checkpoint
+            # Recomputed guided forwards must use the same math SDPA as their
+            # original forwards; normal denoising is free to use fused SDPA.
+            if attention is not None and hidden.is_cuda:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+                def checkpoint_contexts():
+                    return (sdpa_kernel(backends=[SDPBackend.MATH]),
+                            sdpa_kernel(backends=[SDPBackend.MATH]))
+                outputs = checkpoint(model_forward, hidden, use_reentrant=False,
+                                     context_fn=checkpoint_contexts)
+            else:
+                outputs = checkpoint(model_forward, hidden, use_reentrant=False)
         else:
-            blocks=list(attention.layers or tuple(f"D{i}" for i in range(len(pipe.transformer.transformer_blocks))))
-            self_blocks=list(attention.affinity_layers or tuple(blocks)) if attention.need_affinity else []
-            collector=AttentionCollector(
-                pipe.transformer,state.token_indices,state.latent_data.shape[1],blocks,
-                query_chunk=int(getattr(self,"query_chunk",64)), self_blocks=self_blocks,capture_heads=True)
-            with collector.capture(text_len=state.prompt_embeds.shape[1],capture_self=attention.need_affinity):
-                conditional_pred=self._predict(state,step,True)
-            heads=collector.heads_tensor()
-            gh,gw=state.grid
-            head_maps=heads.reshape(heads.shape[0],heads.shape[1],gh,gw)
-            labels=tuple(collector.head_labels())
-            affinity=collector.mean_self_map() if attention.need_affinity else None
-            batch=AttentionBatch(head_maps,labels,affinity)
-        if state.cfg>1:
-            # Avoid constructing an unnecessary unconditional gradient graph.
-            # During differentiable sampling the negative branch contributes
-            # to the derivative of the denoising prediction. During ordinary
-            # guidance, computing it without a graph saves substantial memory.
+            outputs = model_forward(hidden)
+        if attention is None:
+            return outputs, None
+        if require_affinity:
+            pred, maps, affinity = outputs
+        else:
+            pred, maps = outputs
+            affinity = None
+        labels = tuple(f'{block}:H{head:02d}' for block in blocks
+                       for head in range(maps.shape[1] // len(blocks)))
+        return pred, AttentionBatch(maps, labels, affinity)
+
+    def forward(self, state: _KleinState, step: torch.Tensor,
+                *, attention: AttentionRequest | None) -> Prediction:
+        conditional_pred, batch = self._predict(state, step, True, attention)
+        if state.cfg > 1:
+            # Conditional and unconditional branches are both differentiated
+            # for post-guidance denoising. The guidance-only prediction does
+            # not depend on the unconditional branch, so skip its graph there.
             if torch.is_grad_enabled() and attention is None:
-                negative_pred=self._predict(state,step,False)
+                negative_pred, _ = self._predict(state, step, False)
             else:
                 with torch.no_grad():
-                    negative_pred=self._predict(state,step,False)
-            conditional_pred=negative_pred+state.cfg*(conditional_pred-negative_pred)
-        return Prediction(conditional_pred,batch)
+                    negative_pred, _ = self._predict(state, step, False)
+            conditional_pred = negative_pred + state.cfg * (conditional_pred - negative_pred)
+        return Prediction(conditional_pred, batch)
 
     def advance(self,state: _KleinState,step: torch.Tensor,prediction: Prediction) -> None:
         pipe=self._pipe
@@ -250,7 +310,12 @@ class Flux2Klein:
         )
         latents = pipe._unpatchify_latents(unpacked * std + mean)
         latents = latents.to(get_module_execution_device(pipe.vae), dtype=pipe.vae.dtype)
-        pixels = pipe.vae.decode(latents, return_dict=False)[0]
+        if self.train_checkpoint_vae and torch.is_grad_enabled() and latents.requires_grad:
+            from torch.utils.checkpoint import checkpoint
+            pixels = checkpoint(lambda x: pipe.vae.decode(x, return_dict=False)[0],
+                                latents, use_reentrant=False)
+        else:
+            pixels = pipe.vae.decode(latents, return_dict=False)[0]
         pixels = (pixels.float() / 2 + 0.5).clamp(0, 1)
         original_w, original_h = state.original_size
         if pixels.shape[-2:] != (original_h, original_w):

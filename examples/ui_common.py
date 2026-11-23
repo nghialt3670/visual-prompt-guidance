@@ -31,7 +31,7 @@ def serve(demo, *, default_port: int):
     if args.config:
         import os
         os.environ['VPG_CONFIG'] = args.config
-    demo().queue().launch(server_name=args.host, server_port=args.port, share=True)
+    demo().queue().launch(server_name=args.host, server_port=args.port)
 
 
 @lru_cache(maxsize=4)
@@ -95,6 +95,9 @@ def canvas_click(editor, tool, points, evt: gr.SelectData):
 
 
 def canvas_clear(editor, tool, *, clear_brush: bool = False):
+    """Reset point, box, and scribble marks without removing the input image."""
+    if not editor or editor.get('background') is None:
+        return [], gr.update()
     bg, layers = parse_editor(editor)
     if clear_brush:
         layers = []
@@ -282,6 +285,18 @@ class Panel:
         # uninitialized selector, not the user's choice to deselect every head.
         rows = _table_rows(updates.pop('selected_heads'))
         chosen = selected_heads_from_table(rows)
+        standard = not self.training and updates.get('inference_mode') == 'standard'
+        if standard:
+            # Unguided inference never needs a catalog/checkpoint. Keep the
+            # previous head selection so returning to Guided is nondestructive.
+            if chosen:
+                updates['selected_heads'] = chosen
+                updates['selected_layers'] = _derived_layers(chosen)
+            else:
+                previous = profile_settings(self.profile)
+                updates['selected_heads'] = list(previous['selected_heads'])
+                updates['selected_layers'] = list(previous['selected_layers'])
+            return updates
         if not rows:
             try:
                 catalog = get_attention_catalog(updates['model'], updates.get('model_id') or '')
@@ -386,7 +401,8 @@ class Panel:
                 add('max_side', gr.Slider(64, 1024, value=init['max_side'], step=32, label='Max side (px)'))
                 add('seed', gr.Number(value=init['seed'], precision=0, label='Seed'))
 
-        with gr.Accordion('Guidance', open=True):
+        with gr.Accordion('Guidance', open=True,
+                          visible=self.training or init['inference_mode'] == 'guided') as self.guidance_panel:
             with gr.Row():
                 add('guide_steps', gr.Slider(0, 60, value=init['guide_steps'], step=1, label='Guided steps'))
                 add('strength', gr.Number(value=init['strength'], label='Guidance strength'))
@@ -468,7 +484,8 @@ class Panel:
                         label='Separate adaptive scoring losses (empty = guidance losses)'))
                 add('updater', gr.State(init['updater']))  # Only built-in updater; injectable engines remain supported.
 
-        with gr.Accordion('Propagation', open=False):
+        with gr.Accordion('Propagation', open=False,
+                          visible=self.training or init['inference_mode'] == 'guided') as self.propagation_panel:
             enabled = add('use_propagation', gr.Checkbox(
                 value=init['use_propagation'], label='Enable self-attention propagation'))
             propagation_fields = gr.Group(visible=init['use_propagation'])

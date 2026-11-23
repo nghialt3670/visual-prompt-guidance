@@ -115,3 +115,18 @@ class Scribble:
         token_margin=round(self.edit_margin*max(gw/w,gh/h))
         return _target(pooled, pooled, margin=max(0,token_margin),
                        features={"path": tuple(self.path) if self.path is not None else None})
+
+
+@dataclass(frozen=True)
+class FullImage:
+    """Full editable image; used for standard inference without a visual prompt.
+
+    In particular, native inpainting sees an all-one edit mask rather than
+    accidentally restricting edits to a dummy point/scribble.
+    """
+    def project(self, space: Space) -> Target:
+        gh, gw = space.grid_size
+        if gh < 1 or gw < 1:
+            raise ValueError("Invalid model grid for standard inference")
+        support = torch.ones((1, 1, gh, gw), dtype=torch.float32)
+        return Target(support / (gh * gw), support, support.clone())

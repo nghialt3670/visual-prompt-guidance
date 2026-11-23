@@ -176,11 +176,32 @@ def build_engine(settings: Mapping[str, Any], *, training: bool = False,
     update_name = settings.get("updater", "rms")
     if update_name not in UPDATERS:
         raise ValueError(f"Unknown latent updater {update_name!r}")
-    return Engine(backend if backend is not None else build_backend(settings),
+    instance = backend if backend is not None else build_backend(settings)
+    if training and canonical_model(settings['model']) == 'FLUX.2 Klein':
+        # Exact gradient recomputation. No truncation or gradient detachment.
+        instance.train_checkpoint_transformer = bool(settings.get('train_checkpoint_transformer', True))
+        instance.train_checkpoint_attention = bool(settings.get('train_checkpoint_attention', True))
+        instance.train_checkpoint_vae = bool(settings.get('train_checkpoint_vae', True))
+        instance.train_query_chunk = int(settings.get('train_query_chunk', 16))
+        if instance.train_query_chunk < 1:
+            raise ValueError('train_query_chunk must be positive')
+    return Engine(instance,
                   build_objective(settings), guidance=build_guidance(settings, policy),
                   policy=policy, scoring=build_scoring(settings),
                   transform=build_transform(settings), observers=observers,
                   updater=UPDATERS[update_name])
+
+
+def build_standard_engine(settings: Mapping[str, Any], *, backend=None, observers=()) -> Engine:
+    """Run the backend's ordinary denoising/CFG path with no attention guidance.
+
+    No attention policy/checkpoint, guidance objective, attention collection or
+    target propagation is constructed or executed. The backend still owns the
+    sampling schedule, model forward passes, CFG and decoder.
+    """
+    return Engine(backend if backend is not None else build_backend(settings), None,
+                  guidance=Guidance(strength=0.0, max_steps=0),
+                  policy=Uniform(), transform=None, observers=observers)
 
 
 def train_config(settings: Mapping[str, Any], checkpoint: Path, history: Path):

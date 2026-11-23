@@ -18,7 +18,8 @@ DEFAULT_CONFIG_PATH = Path("configs/project.json")
 LEGACY_CONFIG_PATH = Path("configs/ui_settings.json")
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "tool": "Scribble", "prompt": "Insert a dog", "object_name": "dog", "model": "InstructPix2Pix",
+    "tool": "Scribble", "prompt": "Insert a dog", "object_name": "dog",
+    "inference_mode": "guided", "model": "InstructPix2Pix",
     "device": "auto", "dtype": "auto", "model_id": None,
     "selected_losses": ["coverage"], "scoring_losses": [],
     "coverage_w": 1.0, "focal_w": 1.0, "moment_w": 1.0,
@@ -32,6 +33,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "learned_checkpoint": "", "dataset_path": "", "learned_temperature": 1.0,
     "training_epochs": 1, "learning_rate": 0.001, "optimizer_name": "adamw", "weight_decay": 0.0,
     "train_debug_autograd": False,
+    "train_checkpoint_transformer": True, "train_checkpoint_attention": True,
+    "train_checkpoint_vae": True, "train_query_chunk": 16,
     "edit_loss_name": "l1", "edit_loss_weight": 1.0,
     "background_loss_name": "l1", "background_loss_weight": 1.0,
     "image_loss_name": "l1", "inside_weight": 1.0, "outside_weight": 1.0,

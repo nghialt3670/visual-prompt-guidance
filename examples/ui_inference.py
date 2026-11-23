@@ -8,13 +8,13 @@ import gradio as gr
 
 from ui_common import (
     Panel, CANVAS_HEIGHT, serve, canvas_click, canvas_clear,
-    parse_editor, canvas_visual, backend_for, checkpoint_choices,
+    parse_editor, canvas_visual, to_pil_rgb, backend_for, checkpoint_choices,
     table_rows_from_labels,
 )
 from visual_prompt_guidance.backends.attention_catalog import labels_from_catalog
-from visual_prompt_guidance import Request
+from visual_prompt_guidance import Request, FullImage
 from visual_prompt_guidance.config import save_profile, config_path, profile_settings
-from visual_prompt_guidance.runtime import build_engine, model_options, build_observers
+from visual_prompt_guidance.runtime import build_engine, build_standard_engine, model_options, build_observers
 from visual_prompt_guidance.experiments import create_run_dir, save_run_config
 from visual_prompt_guidance.heads import Learned
 
@@ -48,57 +48,85 @@ def choose_checkpoint(path, catalog=None):
     )
 
 
-def inference_run(editor, points, *values, panel: Panel):
+def inference_run(editor, points, *values, panel: Panel, standard_image=None):
     try:
         settings = panel.settings(*values)
-        img, _ = parse_editor(editor)
-        visual = canvas_visual(editor, settings['tool'], points)
+        standard = settings.get('inference_mode') == 'standard'
+        if standard and standard_image is not None:
+            img = to_pil_rgb(standard_image)
+        else:
+            img, _ = parse_editor(editor)
+        visual = FullImage() if standard else canvas_visual(editor, settings['tool'], points)
+        if not str(settings['prompt']).strip():
+            raise ValueError('Enter an edit instruction')
         panel.save(*values)
         folder = create_run_dir('generate')
         options = model_options(settings)
+        if standard:
+            options['skip_attention_tokens'] = True
         save_run_config(folder, {
             'workflow': 'generate', 'source': 'ui_inference',
             'config_source': str(config_path()), 'settings': settings,
             'model_options': options, 'points': points or []
         })
         img.save(folder / 'input.png')
-        if settings['tool'] == 'Scribble' and getattr(visual, 'mask', None) is not None:
+        if not standard and settings['tool'] == 'Scribble' and getattr(visual, 'mask', None) is not None:
             visual.mask.save(folder / 'visual_prompt.png')
-        engine = build_engine(settings, backend=backend_for(settings),
-                              observers=build_observers(settings, folder))
+        backend = backend_for(settings)
+        observers = build_observers(settings, folder)
+        engine = (build_standard_engine(settings, backend=backend, observers=observers)
+                  if standard else build_engine(settings, backend=backend, observers=observers))
         request = Request(data={'image': img, 'prompt': settings['prompt'],
-                                'object_phrase': settings['object_name']}, options=options)
+                                'object_phrase': settings['prompt'] if standard else settings['object_name']},
+                          options=options)
         result = engine.run(request, visual)
         result.output.save(folder / 'result.png')
-        return result.output, f'Saved `{folder}` · {len(result.events)} denoising steps'
+        return result.output, f'{"Standard" if standard else "Guided"} inference · Saved `{folder}` · {len(result.events)} denoising steps'
     except Exception as e:
         raise gr.Error(f'Inference failed: {e}') from e
 
 
 def build_demo():
     init = profile_settings('generate')
+    is_guided = init['inference_mode'] == 'guided'
     with gr.Blocks(title='Visual Prompt Guidance · Inference') as demo:
-        gr.Markdown('## Visual Prompt Guidance · Inference\n'
-                    'Draw a scribble or click to select a point / box. The model runs with the saved **Generate** profile.')
-        save_btn = gr.Button('Save inference settings', size='sm')
+        gr.Markdown('## Visual Prompt Guidance · Inference')
+        with gr.Row():
+            mode = gr.Radio([('Standard (no guidance)', 'standard'),
+                             ('Visual guidance', 'guided')],
+                            value=init['inference_mode'], label='Mode', scale=4)
+            save_btn = gr.Button('Save settings', size='sm', scale=1)
         status = gr.Markdown(f'Config: `{config_path()}`')
         points = gr.State([])
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=1):
-                editor = gr.ImageEditor(label='Input canvas', type='pil', image_mode='RGBA',
-                    brush=gr.Brush(default_size=10, colors=['#ff0000'], default_color='#ff0000', color_mode='fixed'),
-                    layers=False, transforms=(), height=CANVAS_HEIGHT)
-                tool = gr.Radio(['Scribble', 'Point', 'Box'], value=init['tool'], label='Visual prompt tool')
-                with gr.Row():
-                    clear_shape = gr.Button('Clear point / box')
-                    clear_all = gr.Button('Clear all annotations')
-            with gr.Column(scale=1):
-                output = gr.Image(label='Edited output', height=CANVAS_HEIGHT, type='pil')
-                run_status = gr.Markdown('')
+        # Only image inputs and output live in this equal-height row.
+        # The tool/clear controls are BELOW it; they must not stretch a column.
+        with gr.Row(equal_height=True, elem_classes=['vpg-image-pair']):
+            with gr.Column(scale=1, min_width=0):
+                editor = gr.ImageEditor(
+                    label='Input canvas', type='pil', image_mode='RGBA',
+                    brush=gr.Brush(default_size=10, colors=['#ff0000'],
+                                   default_color='#ff0000', color_mode='fixed'),
+                    layers=False, transforms=(), height=CANVAS_HEIGHT,
+                    elem_id='vpg-input-editor', visible=is_guided)
+                standard_image = gr.Image(
+                    label='Input image', type='pil', height=CANVAS_HEIGHT,
+                    elem_id='vpg-standard-input', visible=not is_guided)
+            with gr.Column(scale=1, min_width=0):
+                output = gr.Image(label='Edited output', height=CANVAS_HEIGHT,
+                                  type='pil', elem_id='vpg-output-image')
+        with gr.Row(visible=is_guided) as visual_controls:
+            tool = gr.Radio(['Scribble', 'Point', 'Box'], value=init['tool'],
+                            label='Visual prompt', scale=4)
+            clear_marks = gr.Button('Clear annotations', size='sm', scale=1)
+        run_status = gr.Markdown('')
         with gr.Row():
-            prompt = gr.Textbox(value=init['prompt'], label='Edit instruction', scale=2)
-            object_name = gr.Textbox(value=init['object_name'], label='Target object phrase', scale=1)
+            prompt = gr.Textbox(value=init['prompt'], label='Edit instruction', scale=3)
+            object_group = gr.Group(visible=is_guided)
+            with object_group:
+                object_name = gr.Textbox(value=init['object_name'],
+                                         label='Target object phrase', scale=1)
         panel = Panel('generate', training=False)
+        panel.add('inference_mode', mode)
         panel.add('tool', tool)
         panel.add('prompt', prompt)
         panel.add('object_name', object_name)
@@ -112,9 +140,31 @@ def build_demo():
         panel.connect_save(save_btn, status)
         panel.connect_autoload(demo)
         editor.select(canvas_click, [editor, tool, points], [points, editor])
-        clear_shape.click(lambda ed, t: canvas_clear(ed, t), [editor, tool], [points, editor])
-        clear_all.click(lambda ed, t: canvas_clear(ed, t, clear_brush=True), [editor, tool], [points, editor])
+        clear_marks.click(lambda ed, t: canvas_clear(ed, t, clear_brush=True),
+                          [editor, tool], [points, editor], queue=False)
         tool.change(lambda: [], outputs=[points], queue=False)
+        def switch_mode(choice, plain, marked):
+            guided = choice == 'guided'
+            plain_update = gr.update(visible=not guided)
+            editor_update = gr.update(visible=guided)
+            # Retain the source while switching input tools. Drawn marks are
+            # discarded on entry to Guided, and ignored entirely in Standard.
+            if guided and plain is not None:
+                img = to_pil_rgb(plain)
+                editor_update = gr.update(visible=True, value={
+                    'background': img, 'layers': [], 'composite': img.convert('RGBA')})
+            elif not guided and marked and marked.get('background') is not None:
+                plain_update = gr.update(visible=True, value=to_pil_rgb(marked['background']))
+            return (plain_update, editor_update,
+                    gr.update(visible=guided), gr.update(visible=guided),
+                    gr.update(visible=guided), gr.update(visible=guided),
+                    gr.update(value=None), '')
+
+        mode.change(
+            switch_mode, [mode, standard_image, editor],
+            [standard_image, editor, visual_controls, object_group,
+             panel.guidance_panel, panel.propagation_panel, output, run_status],
+            queue=False)
         panel.refresh_checkpoints.click(
             lambda current: gr.update(choices=list(dict.fromkeys(
                 [*([current] if current else []), *checkpoint_choices()])), value=current),
@@ -122,8 +172,11 @@ def build_demo():
         panel.load_checkpoint.click(
             choose_checkpoint, [panel.parts['learned_checkpoint'], panel.catalog],
             [panel.parts['head_mode'], panel.parts['selected_heads'], ckpt_status], queue=False)
-        generate.click(lambda ed, pts, *vals: inference_run(ed, pts, *vals, panel=panel),
-                       [editor, points, *panel.components], [output, run_status], concurrency_limit=1)
+        generate.click(
+            lambda ed, plain, pts, *vals: inference_run(
+                ed, pts, *vals, panel=panel, standard_image=plain),
+            [editor, standard_image, points, *panel.components],
+            [output, run_status], concurrency_limit=1)
     return demo
 
 

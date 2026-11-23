@@ -1,6 +1,7 @@
 """Generic gradient-guidance engine. Contains no model, prompt or loss names."""
 from __future__ import annotations
 from dataclasses import dataclass, replace
+from contextlib import nullcontext
 from typing import Callable, Sequence
 import torch
 from .contracts import (
@@ -48,7 +49,7 @@ class Engine:
     differentiable latents and head-resolved spatial attention.
     """
     def __init__(
-        self, backend: ModelAdapter, objective: Objective, *,
+        self, backend: ModelAdapter, objective: Objective | None, *,
         guidance: Guidance = Guidance(),
         policy: HeadPolicy | None = None,
         scoring: Objective | None = None,
@@ -81,13 +82,16 @@ class Engine:
             raise ValueError("Differentiable training requires a non-adaptive head policy")
         if not self.guidance.strength or self.guidance.max_steps == 0:
             raise ValueError("Differentiable training needs at least one guided sampling step")
-        # Flash/memory-efficient CUDA SDPA generally does not implement
-        # double backward. Use the math kernel for higher-order guidance.
-        if torch.cuda.is_available():
-            from torch.nn.attention import SDPBackend, sdpa_kernel
-            with sdpa_kernel(backends=[SDPBackend.MATH]):
-                return self._run(request, prompt, differentiable=True)
+        # Only the inner guidance gradient requires second-order attention.
+        # Native post-guidance denoising uses PyTorch's memory-efficient SDPA.
         return self._run(request, prompt, differentiable=True)
+
+    @staticmethod
+    def _guidance_attention_context(differentiable: bool, current: torch.Tensor):
+        if differentiable and current.is_cuda:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            return sdpa_kernel(backends=[SDPBackend.MATH])
+        return nullcontext()
 
     def _run(self, request: Request, prompt: VisualPrompt, *, differentiable: bool) -> Result:
         space = self.backend.space(request)
@@ -110,34 +114,37 @@ class Engine:
             guided = cfg.strength > 0 and (cfg.max_steps is None or index < cfg.max_steps)
             losses={}; rms=None; labels=(); weights=(); before=(); after=(); maps_cpu=None; extras={}
             if guided:
+                if self.objective is None:
+                    raise ValueError("Guided sampling requires an attention objective")
                 with torch.enable_grad():
                     current = self.backend.latent(state)
                     original = current if differentiable else current.detach()
                     if not original.requires_grad:
                         original = original.requires_grad_(True)
                     self.backend.set_latent(state,original)
-                    pre=self.backend.forward(state,step,attention=capture)
-                    batch=pre.attention
-                    if batch is None:
-                        raise RuntimeError("Backend returned no attention for a guided step")
-                    labels=batch.labels
-                    if tuple(batch.maps.shape[2:]) != tuple(target.density.shape[2:]):
-                        raise ValueError("Backend attention grid differs from prompt target grid")
-                    if self.transform is not None:
-                        target=self.transform.apply(target,batch,index)
-                    w=self.policy.weights(labels,device=batch.maps.device)
-                    w=w.float() if differentiable else w.detach().float()
-                    if w.shape!=(len(labels),) or (w<0).any() or not torch.isfinite(w).all() or w.sum()<=0:
-                        raise ValueError("Head policy produced invalid weights")
-                    w=w/w.sum()
-                    weighted=aggregate(batch.maps,w)
-                    component_total, parts=self.objective.evaluate(weighted,target)
-                    scalar=component_total.mean()
-                    grad=torch.autograd.grad(
-                        scalar, original, create_graph=differentiable, allow_unused=True
-                    )[0]
-                    if grad is None:
-                        raise RuntimeError("Guidance loss has no gradient to model latent; check attention extraction")
+                    with self._guidance_attention_context(differentiable, original):
+                        pre=self.backend.forward(state,step,attention=capture)
+                        batch=pre.attention
+                        if batch is None:
+                            raise RuntimeError("Backend returned no attention for a guided step")
+                        labels=batch.labels
+                        if tuple(batch.maps.shape[2:]) != tuple(target.density.shape[2:]):
+                            raise ValueError("Backend attention grid differs from prompt target grid")
+                        if self.transform is not None:
+                            target=self.transform.apply(target,batch,index)
+                        w=self.policy.weights(labels,device=batch.maps.device)
+                        w=w.float() if differentiable else w.detach().float()
+                        if w.shape!=(len(labels),) or (w<0).any() or not torch.isfinite(w).all() or w.sum()<=0:
+                            raise ValueError("Head policy produced invalid weights")
+                        w=w/w.sum()
+                        weighted=aggregate(batch.maps,w)
+                        component_total, parts=self.objective.evaluate(weighted,target)
+                        scalar=component_total.mean()
+                        grad=torch.autograd.grad(
+                            scalar, original, create_graph=differentiable, allow_unused=True
+                        )[0]
+                        if grad is None:
+                            raise RuntimeError("Guidance loss has no gradient to model latent; check attention extraction")
                     new_latent,rms=self.updater(original,grad,cfg)
                     if differentiable:
                         if not new_latent.requires_grad or new_latent.grad_fn is None:
