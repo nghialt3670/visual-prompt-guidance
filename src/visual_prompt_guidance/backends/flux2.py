@@ -5,6 +5,7 @@ of the framework core. Both base editing and native inpainting are supported.
 """
 from __future__ import annotations
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
@@ -12,6 +13,19 @@ import torch
 from PIL import Image, ImageOps
 from ..contracts import Request, Space, Target, AttentionBatch, AttentionRequest, Prediction
 from .flux2_attention import AttentionCollector, find_object_token_indices
+
+
+def _fresh_sdpa_context(math_attention: bool):
+    """Return a new, one-use SDPA context each time checkpoint recomputes.
+
+    Non-reentrant checkpoint's context_fn cannot safely return a generator
+    context manager such as sdpa_kernel for higher-order autograd: PyTorch may
+    re-enter that same context in more than one recomputation.
+    """
+    if math_attention:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        return sdpa_kernel(backends=[SDPBackend.MATH])
+    return nullcontext()
 
 
 @dataclass
@@ -212,6 +226,20 @@ class Flux2Klein:
         if chunk < 1:
             raise ValueError('Attention query chunk size must be positive')
 
+        # When a higher-order gradient triggers checkpoint recomputation,
+        # PyTorch can recompute the same checkpoint more than once. A
+        # context_fn that returns sdpa_kernel(...) produces a ONE-SHOT
+        # generator context manager and fails on the second entry.
+        # Instead, create a *fresh* SDPA context in every model_forward call.
+        # This also guarantees that the forward and recomputed passes use the
+        # same MATH attention kernel for differentiable guidance.
+        math_attention = bool(
+            attention is not None
+            and self.train_checkpoint_transformer
+            and torch.is_grad_enabled()
+            and hidden.is_cuda
+        )
+
         def model_forward(model_input):
             collector = None
             if attention is not None:
@@ -220,10 +248,9 @@ class Flux2Klein:
                     self_blocks=self_blocks, capture_heads=True,
                     checkpoint_chunks=self.train_checkpoint_attention,
                 )
-            from contextlib import nullcontext
             hooks = (collector.capture(text_len=text_len, capture_self=require_affinity)
                      if collector is not None else nullcontext())
-            with hooks:
+            with _fresh_sdpa_context(math_attention), hooks:
                 with pipe.transformer.cache_context(cfg_label):
                     pred = pipe.transformer(
                         hidden_states=model_input, timestep=timestep, guidance=None,
@@ -241,17 +268,9 @@ class Flux2Klein:
 
         if self.train_checkpoint_transformer and torch.is_grad_enabled() and hidden.requires_grad:
             from torch.utils.checkpoint import checkpoint
-            # Recomputed guided forwards must use the same math SDPA as their
-            # original forwards; normal denoising is free to use fused SDPA.
-            if attention is not None and hidden.is_cuda:
-                from torch.nn.attention import SDPBackend, sdpa_kernel
-                def checkpoint_contexts():
-                    return (sdpa_kernel(backends=[SDPBackend.MATH]),
-                            sdpa_kernel(backends=[SDPBackend.MATH]))
-                outputs = checkpoint(model_forward, hidden, use_reentrant=False,
-                                     context_fn=checkpoint_contexts)
-            else:
-                outputs = checkpoint(model_forward, hidden, use_reentrant=False)
+            # Do not use sdpa_kernel as checkpoint(context_fn=...): the
+            # recompute context can be re-entered by higher-order autograd.
+            outputs = checkpoint(model_forward, hidden, use_reentrant=False)
         else:
             outputs = model_forward(hidden)
         if attention is None:
