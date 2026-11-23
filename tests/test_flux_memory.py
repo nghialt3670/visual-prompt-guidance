@@ -135,3 +135,35 @@ def test_invalid_attention_chunk_rejected():
     settings.update(model='FLUX.2 Klein', train_query_chunk=0)
     with pytest.raises(ValueError, match='train_query_chunk'):
         build_engine(settings, training=True, backend=FakeBackend())
+
+
+def test_recomputed_attention_context_supports_higher_order_backward():
+    """Regression: checkpoint(context_fn=sdpa_kernel) is one-shot and crashes.
+
+    The FLUX backend must instead create a *new* math-SDPA context on every
+    model_forward call, including multiple higher-order recomputations.
+    """
+    from torch.utils.checkpoint import checkpoint
+    from torch.nn import functional as F
+    from visual_prompt_guidance.backends.flux2 import _fresh_sdpa_context
+
+    def run(checkpointed):
+        x = torch.randn(1, 2, 4, 4, requires_grad=True)
+
+        def model_forward(v):
+            with _fresh_sdpa_context(True):
+                return F.scaled_dot_product_attention(v, v, v)
+
+        y = checkpoint(model_forward, x, use_reentrant=False) if checkpointed else model_forward(x)
+        inner_grad = torch.autograd.grad(y.square().sum(), x, create_graph=True)[0]
+        inner_grad.square().sum().backward()
+        assert torch.isfinite(x.grad).all()
+        return x, y, inner_grad
+
+    torch.manual_seed(42)
+    x0, out0, grad0 = run(False)
+    torch.manual_seed(42)
+    x1, out1, grad1 = run(True)
+    torch.testing.assert_close(out0, out1)
+    torch.testing.assert_close(grad0, grad1)
+    torch.testing.assert_close(x0.grad, x1.grad, rtol=1e-4, atol=1e-5)

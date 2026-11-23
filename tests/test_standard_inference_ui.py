@@ -74,6 +74,27 @@ def test_standard_inference_without_point_box_scribble(tmp_path, monkeypatch):
     assert backend.attention_requests == [None, None]
 
 
+def test_standard_inference_saves_attention_maps_when_requested(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv('VPG_CONFIG', str(tmp_path / 'project.json'))
+    backend = TrackingBackend()
+    monkeypatch.setattr(ui_inference, 'backend_for', lambda settings: backend)
+    settings = profile_settings('generate')
+    settings.update(inference_mode='standard', prompt='add a dog', object_name='',
+                    steps=2, max_side=128, save_maps=True, observer_interval=1)
+
+    class FakePanel:
+        def settings(self, *args): return settings
+        def save(self, *args): pass
+
+    image = Image.fromarray(np.full((16, 16, 3), 120, dtype=np.uint8))
+    ui_inference.inference_run(None, [], panel=FakePanel(), standard_image=image)
+    run = next((tmp_path / 'outputs' / 'generate').iterdir())
+    assert backend.attention_requests[0] is not None
+    assert (run / 'head_maps' / 'step_000' / 'head_000.npy').is_file()
+    assert (run / 'head_maps' / 'step_000' / 'head_000.png').is_file()
+
+
 def test_standard_mode_can_save_without_head_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv('VPG_CONFIG', str(tmp_path / 'project.json'))
     with gr.Blocks():

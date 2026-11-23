@@ -60,3 +60,16 @@ def test_head_table_explicit_uncheck_remains_invalid(monkeypatch):
     panel.parts = {key: object() for key in ('model', 'model_id', 'selected_heads')}
     with pytest.raises(ValueError, match='Select at least one'):
         panel._updated_settings('FLUX.2 Klein', '', [[False, 'D0', 'H00']])
+
+
+def test_switched_catalog_without_metadata_returns_five_outputs_and_clears_choices(monkeypatch):
+    import ui_common
+    monkeypatch.setattr(ui_common, 'get_attention_catalog', lambda *args: (_ for _ in ()).throw(
+        RuntimeError('metadata offline')))
+    result = ui_common.switched_catalog('FLUX.2 Klein', '')
+    assert len(result) == 5
+    catalog, table, affinity, layers, info = result
+    assert catalog is None
+    assert affinity['choices'] == [] and affinity['value'] == []
+    assert layers['choices'] == [] and layers['value'] == []
+    assert 'metadata offline' in info

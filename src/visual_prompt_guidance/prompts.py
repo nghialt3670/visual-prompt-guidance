@@ -1,8 +1,7 @@
 """Standard prompt implementations; users can supply any VisualPrompt Protocol."""
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Any, Sequence
-import math
+from dataclasses import dataclass
+from typing import Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F

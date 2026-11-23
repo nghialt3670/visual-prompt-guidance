@@ -62,7 +62,7 @@ def inference_run(editor, points, *values, panel: Panel, standard_image=None):
         panel.save(*values)
         folder = create_run_dir('generate')
         options = model_options(settings)
-        if standard:
+        if standard and not settings.get('save_maps', False):
             options['skip_attention_tokens'] = True
         save_run_config(folder, {
             'workflow': 'generate', 'source': 'ui_inference',

@@ -20,7 +20,14 @@ class FileObserver:
         self.export_maps=bool(maps)
         self.export_images=bool(images)
         self.interval=interval
+        self._cmap=None
+        if self.export_images:
+            from matplotlib import colormaps
+            self._cmap=colormaps["inferno"]
         self._steps=[]; self._head_rows=[]
+
+    def wants_maps_at(self, index: int) -> bool:
+        return self.wants_maps and index % self.interval == 0
 
     def step(self, event: StepEvent) -> None:
         self._steps.append({"step":event.index,"timestep":str(event.timestep),
@@ -29,7 +36,8 @@ class FileObserver:
         for i, label in enumerate(event.labels):
             map_i = event.head_maps[:,i] if event.head_maps is not None else None
             self._head_rows.append({
-                "step":event.index,"head":label,"weight":event.weights[i],
+                "step":event.index,"head":label,
+                "weight":event.weights[i] if i < len(event.weights) else "",
                 "before":event.scores_before[i] if event.scores_before else "",
                 "after":event.scores_after[i] if event.scores_after else "",
                 "mean_attention":float(map_i.mean()) if map_i is not None else "",
@@ -44,11 +52,10 @@ class FileObserver:
             if self.export_maps:
                 np.save(folder/f"{safe}.npy",data)
             if self.export_images:
-                from matplotlib import colormaps
                 view=data[0]
                 lo,hi=float(view.min()),float(view.max())
                 normalized=(view-lo)/max(hi-lo,1e-9)
-                color=(colormaps["inferno"](normalized)[...,:3]*255).astype(np.uint8)
+                color=(self._cmap(normalized)[...,:3]*255).astype(np.uint8)
                 Image.fromarray(color).save(folder/f"{safe}.png")
         
     def end(self, result: Result) -> None:

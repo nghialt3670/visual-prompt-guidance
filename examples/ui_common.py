@@ -31,7 +31,7 @@ def serve(demo, *, default_port: int):
     if args.config:
         import os
         os.environ['VPG_CONFIG'] = args.config
-    demo().queue().launch(server_name=args.host, server_port=args.port, share=True)
+    demo().queue().launch(server_name=args.host, server_port=args.port)
 
 
 @lru_cache(maxsize=4)
@@ -200,6 +200,17 @@ def auto_load_heads(model, model_id, saved_rows=None, *, restore=False):
         return None, gr.update() if restore else gr.update(value=[]), f'**Could not read attention metadata:** {error}'
 
 
+def switched_catalog(model, model_id):
+    """Backend switch: reset affinity and layer choices from the new model's metadata."""
+    catalog, table, info = auto_load_heads(model, model_id, restore=False)
+    if catalog:
+        affinity = list(catalog['default_affinity_layers'])
+        return (catalog, table, gr.update(choices=catalog['layers'], value=affinity),
+                gr.update(choices=catalog['layers'], value=list(catalog['layers'])), info)
+    return (catalog, table, gr.update(choices=[], value=[]),
+            gr.update(choices=[], value=[]), info)
+
+
 def table_summary(table_rows, catalog):
     selected = selected_heads_from_table(table_rows)
     if catalog:
@@ -209,6 +220,13 @@ def table_summary(table_rows, catalog):
 
 def set_all_rows_selected(table_rows, selected=True):
     return gr.update(value=[[bool(selected), str(row[1]), str(row[2])]
+                            for row in _table_rows(table_rows)
+                            if row is not None and len(row) >= 3])
+
+
+def select_heads_in_layers(table_rows, layers):
+    selected_layers = set(layers or [])
+    return gr.update(value=[[str(row[1]) in selected_layers, str(row[1]), str(row[2])]
                             for row in _table_rows(table_rows)
                             if row is not None and len(row) >= 3])
 
@@ -366,11 +384,14 @@ class Panel:
             affinity_choices = list(initial_catalog['layers'])
             saved_affinity = [x for x in init['propagation_layers'] if x in affinity_choices]
             initial_affinity = saved_affinity or list(initial_catalog['default_affinity_layers'])
+            initial_layer_choices = affinity_choices
         else:
             # Valid inputs must be available before demo.load() finishes.
             # Gradio pre-validates even hidden or collapsed controls.
             affinity_choices = list(dict.fromkeys(init['propagation_layers']))
             initial_affinity = list(init['propagation_layers'])
+            initial_layer_choices = _derived_layers(selected_heads_from_table(initial_rows))
+        initial_layer_value = _derived_layers(selected_heads_from_table(initial_rows))
 
         with gr.Accordion('Backend', open=True):
             with gr.Row():
@@ -434,6 +455,15 @@ class Panel:
                     label='Attention heads', max_height=320, wrap=False,
                     column_widths=['80px', '125px', '100px'],
                 ))
+                with gr.Row():
+                    head_layers = gr.Dropdown(
+                        choices=initial_layer_choices, value=initial_layer_value,
+                        multiselect=True, label='Target layers')
+                    select_layers = gr.Button('Select all heads in layers', size='sm')
+                self.head_layers = head_layers
+                select_layers.click(select_heads_in_layers,
+                                    [self.parts['selected_heads'], head_layers],
+                                    [self.parts['selected_heads']], queue=False)
                 with gr.Row():
                     select_all = gr.Button('Select all heads', size='sm')
                     clear_all = gr.Button('Clear selection', size='sm')
@@ -526,20 +556,15 @@ class Panel:
                 previous_affinity = init.get('propagation_layers') or []
                 valid_affinity = [x for x in previous_affinity if x in catalog['layers']]
                 affinity = valid_affinity or list(catalog['default_affinity_layers'])
-                return catalog, table, gr.update(choices=catalog['layers'], value=affinity), info
-            return catalog, table, gr.update(), info
-
-        def switched_catalog(model, model_id):
-            catalog, table, info = auto_load_heads(model, model_id, restore=False)
-            if catalog:
-                affinity = list(catalog['default_affinity_layers'])
-                return catalog, table, gr.update(choices=catalog['layers'], value=affinity), info
-            return catalog, table, gr.update(choices=[], value=[]), info
+                layer_value = _derived_layers(selected_heads_from_table(table['value']))
+                return (catalog, table, gr.update(choices=catalog['layers'], value=affinity),
+                        gr.update(choices=catalog['layers'], value=layer_value), info)
+            return catalog, table, gr.update(), gr.update(), info
 
         def switched_model(model):
             # Previous backend's custom checkpoint must not leak to a new model.
-            cat, rows, affinity, info = switched_catalog(model, '')
-            return gr.update(value=''), cat, rows, affinity, info
+            cat, rows, affinity, layers, info = switched_catalog(model, '')
+            return gr.update(value=''), cat, rows, affinity, layers, info
 
         self._initial_catalog = initial_catalog
         self._switched_catalog = switched_catalog
@@ -547,17 +572,19 @@ class Panel:
         self.parts['model'].input(
             self._switched_model, [self.parts['model']],
             [self.parts['model_id'], self.catalog, self.parts['selected_heads'],
-             self.parts['propagation_layers'], self.head_info], queue=True)
+             self.parts['propagation_layers'], self.head_layers, self.head_info], queue=True)
         self.parts['model_id'].blur(
             self._switched_catalog,
             [self.parts['model'], self.parts['model_id']],
-            [self.catalog, self.parts['selected_heads'], self.parts['propagation_layers'], self.head_info],
+            [self.catalog, self.parts['selected_heads'], self.parts['propagation_layers'],
+             self.head_layers, self.head_info],
             queue=True)
 
     def connect_autoload(self, demo):
         demo.load(self._initial_catalog,
             [self.parts['model'], self.parts['model_id'], self.parts['selected_heads']],
-            [self.catalog, self.parts['selected_heads'], self.parts['propagation_layers'], self.head_info],
+            [self.catalog, self.parts['selected_heads'], self.parts['propagation_layers'],
+             self.head_layers, self.head_info],
             show_progress='minimal')
 
     def connect_save(self, button, status):

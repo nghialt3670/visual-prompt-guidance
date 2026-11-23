@@ -5,7 +5,7 @@ This module contains no backend- or Gradio-specific logic.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -81,6 +81,14 @@ class PixelRegionLoss(RegionLoss):
 
 
 class MaskedLpipsRegionLoss(RegionLoss):
+    """Spatial LPIPS, averaged only over the requested region.
+
+    LPIPS sees the *original full images*, not blacked-out backgrounds. The
+    spatial output is masked *after* feature extraction, which avoids diluting
+    edit loss by the fraction of the canvas that was changed. Perceptual
+    receptive fields can still sample context outside the region (intentional).
+    """
+
     def __init__(self):
         self._lpips = None
 
@@ -90,12 +98,21 @@ class MaskedLpipsRegionLoss(RegionLoss):
             try:
                 import lpips
             except ImportError as error:
-                raise ImportError("pip install lpips to use the lpips training loss") from error
-            self._lpips = lpips.LPIPS(net="alex").eval().requires_grad_(False)
+                raise ImportError("Install lpips (uv sync --extra perceptual) for LPIPS image loss") from error
+            self._lpips = lpips.LPIPS(net="alex", spatial=True).eval().requires_grad_(False)
         network = self._lpips.to(device=predicted.device)
-        pred = predicted.float() * mask
-        tgt = target.float() * mask
-        return network(pred * 2 - 1, tgt * 2 - 1).mean()
+        # LPIPS expects images in [-1,1]. Do NOT multiply by mask first:
+        # doing so introduces a hard artificial edge and spatial dilution.
+        difference = network(predicted.float() * 2 - 1, target.float() * 2 - 1)
+        if difference.ndim != 4 or difference.shape[:2] != (predicted.shape[0], 1):
+            raise ValueError("Spatial LPIPS must produce a [B,1,H,W] loss map")
+        if difference.shape[-2:] != mask.shape[-2:]:
+            difference = F.interpolate(difference, size=mask.shape[-2:],
+                                       mode="bilinear", align_corners=False)
+        weights = mask.to(device=difference.device, dtype=difference.dtype)
+        weights = weights.expand_as(difference)
+        # When the selected region is empty, contribute zero without NaNs.
+        return (difference * weights).sum() / weights.sum().clamp_min(1.0)
 
 
 IMAGE_LOSS_REGISTRY: dict[str, Callable[[], RegionLoss]] = {
@@ -284,9 +301,19 @@ class ImageObjective:
 
     def __call__(self, predicted: torch.Tensor, example: TrainingExample,
                  projected_mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+        return self._compute(predicted, example, projected_mask, require_grad=True)
+
+    @torch.no_grad()
+    def evaluate(self, predicted: torch.Tensor, example: TrainingExample,
+                 projected_mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+        """Same image objective for evaluating completed inference outputs."""
+        return self._compute(predicted, example, projected_mask, require_grad=False)
+
+    def _compute(self, predicted: torch.Tensor, example: TrainingExample,
+                 projected_mask: torch.Tensor, *, require_grad: bool) -> tuple[torch.Tensor, dict[str, float]]:
         if predicted.ndim != 4 or predicted.shape[1] != 3 or predicted.shape[0] != 1:
             raise ValueError("Backend.decode_tensor must return [1,3,H,W] RGB image")
-        if not predicted.requires_grad:
+        if require_grad and not predicted.requires_grad:
             raise RuntimeError("Differentiable decode returned image without an autograd graph")
         target = _rgb_tensor(example.target_image, device=predicted.device)
         if target.shape != predicted.shape:
@@ -409,6 +436,14 @@ class HeadTrainer:
                             stage(f"CUDA peak (sample {len(history) + 1}/{total_items}): "
                                   f"allocated {record['cuda_peak_allocated_gib']:.2f} GiB, "
                                   f"reserved {record['cuda_peak_reserved_gib']:.2f} GiB")
+                    # Record completed-epoch means separately from individual
+                    # samples. Comparing successive samples is misleading when
+                    # their edit masks and intrinsic difficulty differ.
+                    if len(history) % len(dataset) == len(dataset) - 1:
+                        previous = history[-(len(dataset)-1):] if len(dataset) > 1 else []
+                        current_epoch = [r["loss"] for r in previous]
+                        current_epoch.append(record["loss"])
+                        record["epoch_mean_loss"] = sum(current_epoch) / len(current_epoch)
                     history.append(record)
                     if progress is not None:
                         progress(len(history), total_items, record)
@@ -420,6 +455,10 @@ class HeadTrainer:
         hist = Path(config.history)
         hist.parent.mkdir(parents=True, exist_ok=True)
         hist.write_text(json.dumps({"config": vars(config), "image_loss": vars(self.criterion.config),
-                                    "samples": history}, indent=2))
+                                    "samples": history,
+                                    "epoch_means": [
+                                        {"epoch": h["epoch"], "loss": h["epoch_mean_loss"]}
+                                        for h in history if "epoch_mean_loss" in h
+                                    ]}, indent=2))
         weights = policy.weights(policy.labels, device=policy.logits.device).detach().cpu().tolist()
         return TrainResult(config.checkpoint, tuple(history), policy.labels, tuple(weights))

@@ -2,7 +2,6 @@
 from __future__ import annotations
 from dataclasses import replace
 import torch
-import torch.nn.functional as F
 from .contracts import Target, AttentionBatch
 
 

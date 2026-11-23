@@ -134,3 +134,17 @@ def test_no_guidance_runs_without_attention():
     result=Engine(FakeAdapter(),Objective(Loss("cov",losses.coverage)),
                   guidance=Guidance(strength=0)).run(Request(None),Point(35,30))
     assert all(not e.losses for e in result.events)
+
+
+def test_no_guidance_observer_saves_maps_at_export_interval(tmp_path):
+    observer=FileObserver(tmp_path,maps=True,interval=2)
+    result=Engine(FakeAdapter(),Objective(Loss("cov",losses.coverage)),
+                  guidance=Guidance(strength=0),observers=[observer]).run(
+                      Request(None),Point(35,30))
+    assert all(not event.losses and not event.weights for event in result.events)
+    assert (tmp_path/'head_maps'/'step_000'/'head_000.npy').is_file()
+    assert not (tmp_path/'head_maps'/'step_001').exists()
+    assert (tmp_path/'head_maps'/'step_002'/'head_001.npy').is_file()
+    rows=(tmp_path/'heads.csv').read_text().splitlines()
+    assert rows[0].startswith('step,head,weight,')
+    assert rows[1].split(',')[2]==''

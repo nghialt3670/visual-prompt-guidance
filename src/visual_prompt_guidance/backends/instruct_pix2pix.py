@@ -13,7 +13,7 @@ import torch
 from PIL import Image, ImageOps
 
 from ..contracts import AttentionRequest, Prediction, Request, Space, Target
-from .instruct_pix2pix_attention import UNetAttentionCapture, object_tokens, cross_attention_layers, default_layers
+from .instruct_pix2pix_attention import UNetAttentionCapture, object_tokens, cross_attention_layers
 
 
 @dataclass

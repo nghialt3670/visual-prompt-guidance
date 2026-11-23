@@ -55,7 +55,10 @@ def test_generate_checkpoint_auto_restores_exact_layer_order(tmp_path):
     assert profile_settings("generate", path=project)["head_mode"] == "Uniform"  # non-persistent
 
 
-def test_generate_fails_fast_on_mismatched_checkpoint_layers(tmp_path):
+def test_generate_fails_fast_on_mismatched_checkpoint_layers(tmp_path, monkeypatch):
+    # Isolate from the workspace's configs/project.json, whose saved selected_heads
+    # would otherwise trigger the head-ID check before the layer check under test.
+    monkeypatch.setenv("VPG_CONFIG", str(tmp_path / "project.json"))
     policy = Learned()
     policy.weights(("D2:H00",), device=torch.device("cpu"))
     checkpoint = tmp_path / "w.json"

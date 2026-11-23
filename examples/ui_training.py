@@ -5,8 +5,6 @@ Launch: uv run --extra all python examples/ui_training.py --port 7862
 from __future__ import annotations
 
 from dataclasses import asdict
-from math import log
-from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread
 import traceback
@@ -36,6 +34,22 @@ class _StepStatusObserver:
 
     def end(self, result):
         self.notify("Denoising and image decoding completed")
+
+
+def loss_plot_data(records):
+    """Combine per-sample losses with completed-epoch means for Gradio."""
+    sample_points = [
+        {'step': int(r['step']), 'loss': float(r['loss']),
+         'series': f"Image {int(r['sample'])+1}", 'epoch': int(r['epoch']), 'sample': int(r['sample'])}
+        for r in records
+    ]
+    average_points = [
+        {'step': int(r['step']), 'loss': float(r['epoch_mean_loss']),
+         'series': 'Epoch mean', 'epoch': int(r['epoch']), 'sample': int(r['sample'])}
+        for r in records if 'epoch_mean_loss' in r
+    ]
+    return pd.DataFrame.from_records(sample_points + average_points,
+                                     columns=['step', 'loss', 'series', 'epoch', 'sample'])
 
 
 def train_stream(dataset_file, *values, panel: Panel):
@@ -117,7 +131,10 @@ def train_stream(dataset_file, *values, panel: Panel):
                     'max_head_weight': peak,
                     'head_entropy': entropy,
                     'epoch': event['epoch'],
+                    'sample': event['sample'],
                 }
+                if 'epoch_mean_loss' in event:
+                    payload['epoch_mean_loss'] = float(event['epoch_mean_loss'])
                 gpu_note = (f" CUDA peak={event['cuda_peak_allocated_gib']:.2f} GiB"
                             if 'cuda_peak_allocated_gib' in event else '')
                 print(f"[VPG training] Update {count}/{total}: "
@@ -169,7 +186,9 @@ def train_stream(dataset_file, *values, panel: Panel):
             df = pd.DataFrame.from_records(records)
             last_status = (f"Update {payload['step']}/{payload['total']} · epoch {payload['epoch']} · "
                            f"image loss {payload['loss']:.6f} · max head weight {payload['max_head_weight']:.4f}")
-            yield df, df, df, last_status, ''
+            if 'epoch_mean_loss' in payload:
+                last_status += f" · epoch mean {payload['epoch_mean_loss']:.6f}"
+            yield loss_plot_data(records), df, df, last_status, ''
         elif kind == 'done':
             result = payload
             df = pd.DataFrame.from_records(records)
@@ -177,7 +196,7 @@ def train_stream(dataset_file, *values, panel: Panel):
             notify_done = (f'Completed: {len(result.history)} optimizer updates; '
                            f'final loss {last_loss:.6f}; checkpoint {result.checkpoint}')
             print(f'[VPG training] {notify_done}', flush=True)
-            yield df, df, df, f'**{notify_done}** · `{folder}`', result.checkpoint
+            yield loss_plot_data(records), df, df, f'**{notify_done}** · `{folder}`', result.checkpoint
             break
         elif kind == 'error':
             yield (*untouched, f'**Training failed:**\n```text\n{payload}\n```\nSee `{log_file}`', '')
@@ -232,7 +251,8 @@ def build_demo():
         progress_status=gr.Markdown('')
         checkpoint=gr.Textbox(label='Saved checkpoint (usable in Inference)',interactive=False)
         with gr.Row():
-            loss_plot=gr.LinePlot(x='step',y='loss',title='Image-level training loss',
+            loss_plot=gr.LinePlot(x='step',y='loss',color='series',
+                                  title='Image loss · per image and epoch mean',
                                   x_title='Optimizer update',y_title='Loss',height=300)
             gradient_plot=gr.LinePlot(x='step',y='grad_norm',title='Head-logit gradient norm',
                                      x_title='Optimizer update',y_title='Norm',height=300)

@@ -112,6 +112,11 @@ class Engine:
                 need_affinity=(self.transform is not None and self.transform.requires_affinity(index)),
             )
             guided = cfg.strength > 0 and (cfg.max_steps is None or index < cfg.max_steps)
+            capture_observer_maps = not guided and any(
+                getattr(observer, "wants_maps", False)
+                and getattr(observer, "wants_maps_at", lambda _: True)(index)
+                for observer in self.observers
+            )
             losses={}; rms=None; labels=(); weights=(); before=(); after=(); maps_cpu=None; extras={}
             if guided:
                 if self.objective is None:
@@ -165,16 +170,21 @@ class Engine:
                     del pre,batch,weighted,component_total,parts,scalar,grad,original
             # The native backend owns CFG/negative predictions and scheduler behavior.
             with torch.set_grad_enabled(differentiable):
-                post=self.backend.forward(state,step,attention=capture if guided and self.policy.needs_feedback else None)
-                if guided and self.policy.needs_feedback:
-                    if post.attention is None or post.attention.labels!=labels:
-                        raise RuntimeError("Cannot match post-guidance head identities")
-                    after_scores=self.scoring(post.attention.maps,target).detach()
-                    self.policy.update(labels,before_scores,after_scores)
-                    before=tuple(float(x) for x in before_scores.mean(0).cpu().tolist())
-                    after=tuple(float(x) for x in after_scores.mean(0).cpu().tolist())
-                    extras["weights_next"]=tuple(float(x) for x in self.policy.weights(labels, device=after_scores.device).cpu().tolist())
-                self.backend.advance(state,step,post)
+                capture_post_attention = (guided and self.policy.needs_feedback) or capture_observer_maps
+                post=self.backend.forward(state,step,
+                    attention=capture if capture_post_attention else None)
+            if capture_observer_maps and post.attention is not None:
+                labels = post.attention.labels
+                maps_cpu = post.attention.maps.detach().float().cpu()
+            if guided and self.policy.needs_feedback:
+                if post.attention is None or post.attention.labels!=labels:
+                    raise RuntimeError("Cannot match post-guidance head identities")
+                after_scores=self.scoring(post.attention.maps,target).detach()
+                self.policy.update(labels,before_scores,after_scores)
+                before=tuple(float(x) for x in before_scores.mean(0).cpu().tolist())
+                after=tuple(float(x) for x in after_scores.mean(0).cpu().tolist())
+                extras["weights_next"]=tuple(float(x) for x in self.policy.weights(labels, device=after_scores.device).cpu().tolist())
+            self.backend.advance(state,step,post)
             event=StepEvent(index=index,timestep=step,losses=losses,grad_rms=rms,
                             labels=labels,weights=weights,scores_before=before,
                             scores_after=after,head_maps=maps_cpu,extras=extras)

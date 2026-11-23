@@ -13,7 +13,7 @@ from pathlib import Path
 from PIL import Image
 from visual_prompt_guidance.config import resolve_settings, save_profile, config_path
 from visual_prompt_guidance.runtime import build_engine, canonical_model, model_options, build_observers
-from visual_prompt_guidance import Point, Box, Scribble, Request, FileObserver
+from visual_prompt_guidance import Point, Box, Scribble, Request
 from visual_prompt_guidance.training import EditingDataset
 from visual_prompt_guidance.experiments import create_run_dir, save_run_config
 

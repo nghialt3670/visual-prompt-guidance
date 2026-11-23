@@ -1,6 +1,8 @@
 """Pure head weighting. Does not know loss names or block naming conventions."""
 from __future__ import annotations
+import json
 import math
+from pathlib import Path
 from typing import Mapping
 import torch
 
@@ -137,9 +139,7 @@ class Learned(torch.nn.Module):
         # Offline image-level training updates logits using torch.optim.
         pass
 
-    def save(self, path: str | 'Path') -> None:
-        import json
-        from pathlib import Path
+    def save(self, path: str | Path) -> None:
         if self.labels is None or self.logits is None:
             raise ValueError("Learned policy has not been initialized")
         dest = Path(path)
@@ -154,9 +154,7 @@ class Learned(torch.nn.Module):
         dest.write_text(json.dumps(payload, indent=2))
 
     @classmethod
-    def load(cls, path: str | 'Path', *, device: str | torch.device = "cpu") -> 'Learned':
-        import json
-        from pathlib import Path
+    def load(cls, path: str | Path, *, device: str | torch.device = "cpu") -> 'Learned':
         payload = json.loads(Path(path).read_text())
         if payload.get("format") != "visual-prompt-guidance/learned-heads-v1":
             raise ValueError("Unrecognized learned-head checkpoint format")

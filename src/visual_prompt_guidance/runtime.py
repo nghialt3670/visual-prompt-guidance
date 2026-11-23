@@ -195,9 +195,9 @@ def build_engine(settings: Mapping[str, Any], *, training: bool = False,
 def build_standard_engine(settings: Mapping[str, Any], *, backend=None, observers=()) -> Engine:
     """Run the backend's ordinary denoising/CFG path with no attention guidance.
 
-    No attention policy/checkpoint, guidance objective, attention collection or
-    target propagation is constructed or executed. The backend still owns the
-    sampling schedule, model forward passes, CFG and decoder.
+    No attention policy/checkpoint, guidance objective or target propagation is
+    executed. Attention is collected only if a map-saving observer requests it.
+    The backend still owns the sampling schedule, CFG and decoder.
     """
     return Engine(backend if backend is not None else build_backend(settings), None,
                   guidance=Guidance(strength=0.0, max_steps=0),

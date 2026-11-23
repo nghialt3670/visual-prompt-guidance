@@ -53,6 +53,22 @@ def save_training_reports(directory: str | Path, history: Sequence[Mapping[str, 
         for name, value in sorted(zip(labels, weights), key=lambda item: item[1], reverse=True):
             writer.writerow([name, float(value)])
 
+    # Persist per-sample history and the completed-epoch averages separately.
+    # Both files can be read while comparing trends, independent of the UI.
+    with (directory / "sample_losses.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["update", "epoch", "sample", "loss"])
+        for i, item in enumerate(history, start=1):
+            writer.writerow([i, item.get("epoch", 1), item.get("sample", i-1), float(item["loss"])])
+    by_epoch = {}
+    for item in history:
+        by_epoch.setdefault(int(item.get("epoch", 1)), []).append(float(item["loss"]))
+    with (directory / "epoch_losses.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["epoch", "mean_loss", "samples"])
+        for epoch, scores in sorted(by_epoch.items()):
+            writer.writerow([epoch, sum(scores) / len(scores), len(scores)])
+
     chart_path = directory / "loss_curve.png"
     width, height = 1000, 520
     image = Image.new("RGB", (width, height), "white")
@@ -78,9 +94,24 @@ def save_training_reports(directory: str | Path, history: Sequence[Mapping[str, 
             for i, value in enumerate(values)
         ]
         if len(coords) > 1:
-            draw.line(coords, fill="#2563eb", width=3)
+            draw.line(coords, fill="#2563eb", width=2)
         for x, y in (coords if len(coords) <= 40 else [coords[0], coords[-1]]):
             draw.ellipse((x-3, y-3, x+3, y+3), fill="#2563eb")
+        # Overlay completed epoch means at the final update of each epoch.
+        last_step_for_epoch = {}
+        for i, entry in enumerate(history):
+            last_step_for_epoch[int(entry.get("epoch", 1))] = i
+        avg_coords = []
+        for epoch, scores in sorted(by_epoch.items()):
+            i = last_step_for_epoch[epoch]
+            mean = sum(scores) / len(scores)
+            avg_coords.append((round(left + i * (right-left) / max(len(values)-1, 1)),
+                               round(bottom - (mean-lo) / (hi-lo) * (bottom-top))))
+        if len(avg_coords) > 1:
+            draw.line(avg_coords, fill="#ea580c", width=4)
+        for x, y in avg_coords:
+            draw.ellipse((x-4, y-4, x+4, y+4), fill="#ea580c")
+        draw.text((left + 190, 14), "Blue: sample   Orange: epoch mean", fill="#334155")
         draw.text((left, bottom + 26), "1", fill="#475569")
         draw.text((right - 30, bottom + 26), str(len(values)), fill="#475569")
     else:

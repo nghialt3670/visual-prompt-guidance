@@ -1,16 +1,50 @@
-# Visual Prompt Guidance 0.8.7
+# Visual Prompt Guidance 0.9.0
 
 A **small composable framework** for training-free, latent-gradient guidance using spatial attention. A complete rewrite of the public API: the framework is not a FLUX.2 application disguised as a library.
+
+## Region-aware image losses and evaluation (v0.9.0)
+
+The training objective keeps **independent, pluggable edit/background losses**.
+When Edit loss is `lpips`, LPIPS runs with `spatial=True` on the **full
+unmasked** generated and reference images. Its per-pixel perceptual difference
+map is then averaged **inside** the ground-truth `edit_mask` (or projected
+visual edit region if missing). This prevents the large identical masked-out
+background from diluting edit LPIPS. LPIPS still sees context through its
+receptive field; its values are not directly comparable with older run losses.
+Background L1 remains the average RGB pixel error outside the edit mask.
+
+The Training UI overlays completed **epoch-average loss** and one curve per
+training image. The new `epoch_losses.csv` and `sample_losses.csv` are saved
+with `loss_curve.png` and existing reports. Epoch averages are not plotted
+until all samples in that epoch have completed.
+
+After training, compare **learned vs uniform weights** with paired seeds,
+identical prompts, guidance configuration and selected heads:
+
+```bash
+uv run --extra flux2 --extra perceptual python examples/compare_heads.py \
+  --checkpoint outputs/train/YOUR_RUN/learned_heads.json \
+  --dataset data/compbench-vpg/add/manifest_scribble.json \
+  --max-samples 5
+```
+
+The script uses the training run's saved `config.json` if present and stores
+paired images, `paired_losses.csv`, and `summary.json` under `outputs/compare/`.
+Negative `mean_delta_learned_minus_uniform` means learned weights obtained
+lower image loss **on those samples**. Use a held-out set for generalization.
+This comparison is optional; it does not run inside the training loop.
 
 ## Inference modes and canvas cleanup (v0.8.7)
 
 The Inference UI has two saved modes in `generate.inference_mode`:
 
 - **Standard (no guidance):** plain image upload + instruction. Runs the
-  backend's ordinary denoising/CFG/scheduler without attention capture,
-  spatial objectives, latent guidance, propagation, or learned-head checkpoint.
-  No scribble, point, or box is required. FLUX native inpaint mode uses a
-  full-image edit mask when no spatial prompt is supplied.
+  backend's ordinary denoising/CFG/scheduler without spatial objectives, latent
+  guidance, propagation, or learned-head checkpoint. Turn on **Save attention
+  maps** to capture token attention at the configured export interval; otherwise
+  attention capture remains disabled. No scribble, point, or box is required.
+  FLUX native inpaint mode uses a full-image edit mask when no spatial prompt is
+  supplied.
 - **Visual guidance:** draw a scribble, point, or box and configure attention
   guidance normally. A single **Clear annotations** button resets *all*
   visual prompt types without deleting the input source image.
@@ -47,20 +81,28 @@ uv run --extra all python examples/ui_inference.py --host 0.0.0.0 --port 7861
 
 # Training, with per-sample live loss, gradient norm and head-weight plots
 uv run --extra all python examples/ui_training.py --host 0.0.0.0 --port 7862
+
+# Browse saved inference and training images, maps, and reports
+uv run --extra all python examples/ui_visualize.py --host 0.0.0.0 --port 7863
 ```
 
 `examples/gradio_app.py` is a backwards-compatible alias for **Inference only**.
 Both applications share `configs/project.json` (`--config` or `VPG_CONFIG`) and the
 same application-level widgets in `examples/ui_common.py`, but maintain **separate
 Generate and Train profiles**. Normal CLI commands use the exact same profiles.
+The read-only Run Explorer browses `outputs/generate` and `outputs/train`,
+including a zoomable attention-map grid (steps × flattened layer/head),
+per-step metrics, training loss reports, and learned head weights. Filter the
+grid to selected layers or show all layers.
 
 Both pages **automatically restore their own saved profile on startup** and
 populate a compact, scrollable **head table with every layer and head**. Model
-switching reloads the table using lightweight architecture metadata; no separate
-Load Heads button or layer selector is needed. The `Use` column controls the
-active set. The default is all heads for Uniform, Adaptive, or Learned (unless
-a checkpoint supplies a specific learned subset). The table's checked rows
-produce the engine's `selected_heads` and `selected_layers` settings.
+switching reloads the table using lightweight architecture metadata. The
+**Target layers** shortcut selects every head in chosen layers; the table's
+`Use` column still supports individual head selection. The default is all heads
+for Uniform, Adaptive, or Learned (unless a checkpoint supplies a specific
+learned subset). The checked rows produce the engine's `selected_heads` and
+`selected_layers` settings.
 
 The controls are organized into **Backend** (including model-specific CFG/
 inpainting), **Sampling**, **Guidance** (steps, losses, policy/checkpoints),
@@ -261,6 +303,7 @@ examples/
   ui_common.py           # shared widget/metadata support
   ui_inference.py        # inference-only Gradio app
   ui_training.py         # training-only Gradio app with live plots
+  ui_visualize.py        # saved inference and training run explorer
   gradio_app.py          # compatibility launcher for inference
 tests/
   test_framework.py      # mock-backend end-to-end tests

@@ -6,7 +6,6 @@ of the framework core. Both base editing and native inpainting are supported.
 from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import nullcontext
-from typing import Any
 
 import numpy as np
 import torch

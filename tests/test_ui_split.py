@@ -88,13 +88,16 @@ def test_streaming_training_updates_weights_and_writes_reports(tmp_path,monkeypa
     assert any('backpropagating through denoising' in item[3] for item in outputs)
     assert any('Denoising step 1/2 completed' in item[3] for item in outputs)
     df=outputs[-1][0]
-    assert len(df)==2 and list(df['step'])==[1,2]
+    assert len(df[df['series']=='Image 1'])==2
+    assert list(df[df['series']=='Image 1']['step'])==[1,2]
+    assert len(df[df['series']=='Epoch mean'])==2
     assert (checkpoint_log := next((tmp_path/'outputs'/'train').glob('*/training.log'))).is_file()
     assert 'Update 2/2' in checkpoint_log.read_text()
-    assert float(df['max_head_weight'].max())>0
+    assert float(outputs[-1][2]['max_head_weight'].max())>0
     checkpoint=Path(outputs[-1][-1])
     assert checkpoint.is_file()
-    for file in ('history.json','config.json','loss_curve.png','head_weights.csv'):
+    for file in ('history.json','config.json','loss_curve.png','head_weights.csv',
+                 'sample_losses.csv','epoch_losses.csv'):
         assert (checkpoint.parent/file).is_file()
 
 
@@ -166,12 +169,21 @@ def test_ui_automatically_loads_head_metadata_without_restore_button(tmp_path,mo
         assert any(any(target[1]=='load' for target in d['targets']) for d in demo.config['dependencies'])
         labels=labelled_components(demo)
         assert 'Attention heads' in labels
+        assert 'Target layers' in labels
         assert 'Guidance attention layers' not in labels
         assert 'Model' in labels and 'Denoising steps' in labels
         button_values=[c['props'].get('value') for c in demo.config['components']
                        if c['type']=='button']
         assert 'Restore inference settings' not in button_values
         assert 'Restore training settings' not in button_values
+
+
+def test_layer_selection_checks_only_heads_in_targeted_layers():
+    import ui_common
+    rows=[[False,'D0','H00'],[True,'D1','H00'],[True,'D1','H01'],[True,'S0','H00']]
+    updated=ui_common.select_heads_in_layers(rows,['D0','S0'])
+    assert updated['value']==[
+        [True,'D0','H00'],[False,'D1','H00'],[False,'D1','H01'],[True,'S0','H00']]
 
 
 def test_table_selection_derived_engine_layers_and_no_implicit_fallback(tmp_path,monkeypatch):

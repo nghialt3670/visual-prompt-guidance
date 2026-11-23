@@ -326,9 +326,6 @@ def write_visual_manifests(root: Path, tasks: tuple[str, ...] | list[str],
             copy["metadata"] = dict(copy.get("metadata", {}))
             if copy["metadata"].get("region_mask"):
                 copy["metadata"]["region_mask"] = f"{task}/{copy['metadata']['region_mask']}"
-            # If a scribble mask (not path) is used, root paths must also change.
-            if copy["visual"].get("mask"):
-                copy["visual"] = {**copy["visual"], "mask": f"{task}/{copy['visual']['mask']}"}
             combined.append(copy)
     (root / "manifest.json").write_text(json.dumps({"samples": combined}, indent=2) + "\n", encoding="utf-8")
     for visual in visuals:
