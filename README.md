@@ -1,8 +1,23 @@
-# Visual Prompt Guidance 0.7.0
+# Visual Prompt Guidance 0.8.3
 
 A **small composable framework** for training-free, latent-gradient guidance using spatial attention. A complete rewrite of the public API: the framework is not a FLUX.2 application disguised as a library.
 
-## Dedicated inference and training applications (v0.7.0)
+## Training UI responsiveness (v0.8.3)
+
+The Training UI acknowledges the click immediately (`queue=False`), then streams
+stage and per-denoising-step statuses while it loads the model, processes each
+sample and runs higher-order backward. Live metric plots still update only
+**after each optimizer step**, when the image loss and learned head gradients
+become available. A heartbeat keeps the UI alive during long steps; the same
+messages print to the terminal and are saved in
+`outputs/train/<timestamp>/training.log`.
+
+If you get no `[VPG training]` message after clicking **Train**, the request
+has not reached the Gradio backend (check browser/server connectivity). If
+it prints `preparing model and denoising` for a long time, the backend is
+inside its first heavyweight forward pass rather than waiting on the UI.
+
+## Dedicated inference and training applications (v0.8.0)
 
 The monolithic Gradio app was split into two independent entry points:
 
@@ -19,9 +34,25 @@ Both applications share `configs/project.json` (`--config` or `VPG_CONFIG`) and 
 same application-level widgets in `examples/ui_common.py`, but maintain **separate
 Generate and Train profiles**. Normal CLI commands use the exact same profiles.
 
-In **Inference**, select **Learned** in Head policy, choose a checkpoint from
-`outputs/train/*/learned_heads.json`, and click **Load selected checkpoint**. It
-restores the checkpoint's head identities and layer order automatically. In
+Both pages **automatically restore their own saved profile on startup** and
+populate a compact, scrollable **head table with every layer and head**. Model
+switching reloads the table using lightweight architecture metadata; no separate
+Load Heads button or layer selector is needed. The `Use` column controls the
+active set. The default is all heads for Uniform, Adaptive, or Learned (unless
+a checkpoint supplies a specific learned subset). The table's checked rows
+produce the engine's `selected_heads` and `selected_layers` settings.
+
+The controls are organized into **Backend** (including model-specific CFG/
+inpainting), **Sampling**, **Guidance** (steps, losses, policy/checkpoints),
+**Propagation**, and Inference-only **Diagnostics**. The project config remains
+flat for CLI compatibility and is still shared by both applications. Each
+workflow keeps its own `generate`/`train` profile. There is no Restore button;
+use Save to persist changes. A full run also saves its effective settings.
+
+In **Inference**, select **Learned** under Head policy, choose a checkpoint from
+`outputs/train/*/learned_heads.json`, and click **Use checkpoint**. The table
+continues showing all backend heads, while only the checkpoint's trained heads
+are checked. In
 **Training**, select a dataset, optimizer, image loss and heads and click **Train
 head weights**. Live charts update *after every training sample*, not after
 every denoising step. A completed run creates `history.json`, `loss_curve.png`,
@@ -76,7 +107,7 @@ uv run --extra pix2pix python examples/generate.py \
 
 With a standalone source image, use `examples/generate.py --image input.png --prompt "Add a dog" --object dog --point 100 150`, or `--box x0 y0 x1 y1`, `--scribble-mask mask.png`, or `--scribble-path path.json`. The legacy `examples/instruct_pix2pix.py` is now a wrapper around the same Generate CLI.
 
-Each dedicated UI saves/restores its own profile. Inference offers **Load selected checkpoint** for trained weights. Saved weights are referenced by `learned_checkpoint`; inference loads them with `Learned.load`, restoring the *exact trained attention layer order* and rejecting incompatible explicit selections. To avoid confusing comparisons, match the guidance loss, strengths, and denoising schedule of training when applying weights at inference.
+Each dedicated UI automatically restores its own saved profile on startup. Inference offers **Use checkpoint** for trained weights. Saved weights are referenced by `learned_checkpoint`; inference loads them with `Learned.load`, restoring the *exact trained attention layer order* and rejecting incompatible explicit selections. To avoid confusing comparisons, match the guidance loss, strengths, and denoising schedule of training when applying weights at inference.
 
 The app will read existing `configs/ui_settings.json` from v0.5.x if the canonical file does not exist, then write `configs/project.json` at the next save. Uploaded images and ZIP bytes are not persisted as profile settings. Run folders still contain the effective `config.json` snapshot.
 
@@ -352,13 +383,11 @@ the outside-region pixel loss.
 ### UI
 
 Launch `examples/ui_training.py` to train weights. Then launch `examples/ui_inference.py`, choose **Learned** under Head policy, and load the saved checkpoint.
-Optionally select layers and individual heads using checkboxes. Under the
-**Trainable head weights** panel, upload the ZIP or supply a dataset directory,
-select an outer image loss (`l1`, `mse`, `charbonnier`, or `smooth_l1`), set the
-inside/outside weights, epochs, optimizer, learning rate, gradient clipping, and
-checkpoint path. Click **Train head weights**. The generated JSON checkpoint is
-used by the **Generate** button while Learned mode is selected. Adaptive and
-Manual remain available and unchanged.
+Check heads directly in the compact table; no separate layer selector is needed.
+In the Training UI, supply a dataset ZIP/manifest and configure the optimizer,
+image loss, epochs and guidance. Click **Train head weights**. In Inference,
+choose the resulting JSON checkpoint under **Guidance > Attention policy** and
+click **Use checkpoint**; its learned weights are then used for inference.
 
 ### Command line
 
@@ -415,21 +444,20 @@ one image per optimizer step. Large FLUX models may still be impractical.
 No real-checkpoint/GPU training run is claimed: the included CPU tests use a
 differentiable mock generator and validate higher-order gradients numerically.
 
-## Persistent Gradio settings and experiment runs (v0.5.0)
+## Persistent configuration and experiment runs
 
-The optional Gradio app saves **two independent UI configuration snapshots** in
-`configs/ui_settings.json`: one for **Generate** and one for **Training**.
-Change controls and click **Save Generate settings** or **Save Training settings**;
-or simply click **Generate** / **Train head weights**, which saves that workflow's
-settings first. On restart, the last-saved workflow's controls are restored.
-Use **Load Generate settings** and **Load Training settings** to switch presets.
-Model weights are *not* loaded just to restore settings. The active model's
-previously selected layer/head IDs are retained; use **Load available layers / heads**
-when you want to browse the full catalog (this still loads the model checkpoint).
-Image uploads, canvas drawings, and temporary uploaded dataset ZIP files are not
-stored in the preferences file. Use a persistent `dataset_path` to re-run training
-later. Settings are stored on the server and shared by its UI users, so don't
-use this single-user preference file as multi-user account storage.
+The canonical shared file is `configs/project.json`. Settings from both the
+Inference and Training apps are populated on launch; Save or Run persists the
+edited workflow profile. Model metadata is fetched automatically, without
+loading model weights. The `generate` and `train` profiles remain independent;
+CLI scripts use those exact same profiles. `VPG_CONFIG` or `--config` can select
+a different settings file. v0.5.x `configs/ui_settings.json` is read as a
+migration source if the new file does not exist.
+
+All heads of the selected backend appear in a single compact table. Checking
+or unchecking rows determines the active guidance layers and head subset.
+Training checkpoints restore their captured layer IDs and selected head weights.
+If a checkpoint is incompatible with the selected model, the UI rejects it.
 
 Run outputs are kept separate and never intentionally overwrite another run:
 
@@ -452,7 +480,7 @@ outputs/
 ```
 
 All paths are relative to the working directory from which the app starts.
-Specify `VPG_UI_CONFIG=/path/to/settings.json` to move the saved UI settings.
+Specify `VPG_CONFIG=/path/to/project.json` to choose the shared settings file.
 
 CLI training also creates a timestamped run by default:
 
@@ -530,3 +558,33 @@ in replacement tasks the script tries to select the new object after "with".
 Treat this as dataset preparation, not validated supervision quality. Multiple
 visual variants of one source/target pair must stay in the same train/validation
 split to prevent leakage.
+
+
+### v0.8.4: training stability and attention-table startup
+
+- RMS-normalized guidance clamps the *squared* RMS before taking its square root.
+  This prevents NaN higher-order derivatives when the inner gradient is zero,
+  without detaching the normalization term.
+- Save/Train before asynchronous head metadata has loaded selects all heads of
+  the selected backend, including all layers. Explicitly clearing every row
+  still raises an error. Only lightweight model metadata is read.
+- A non-finite learned-head gradient error now includes NaN/Inf counts and
+  suggests reducing denoising/guided steps for numerical troubleshooting.
+
+Start with low denoising/guided step counts when debugging differentiable
+backpropagation on MPS. The full 30-step GPU workload is not validated here.
+
+
+### Diagnosing NaN head-weight gradients (v0.8.5)
+
+Higher-order training differentiates through a guidance gradient and therefore
+needs stable second derivatives. On Apple MPS, **training** with `dtype=auto`
+now selects FP32 instead of the FP16 used by InstructPix2Pix inference. Explicit
+`--dtype` choices are unchanged; run `config.json` records the effective dtype.
+For a short diagnostic test, use `--steps 4 --guided-steps 1 --max-side 128`.
+
+When gradients are still NaN, enable **Diagnose NaN gradients** in Training UI
+or pass `--detect-anomaly` to `examples/train_heads.py`. PyTorch then reports
+the first autograd operation that emits NaN gradients, with its forward stack
+trace. This is slower, so leave it disabled for normal training. The trainer
+continues to refuse optimizer steps on non-finite gradients (no silent fixes).

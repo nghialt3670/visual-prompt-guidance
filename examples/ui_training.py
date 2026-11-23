@@ -7,9 +7,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from math import log
 from pathlib import Path
-from queue import Queue
+from queue import Queue, Empty
 from threading import Thread
 import traceback
+import time
 
 import gradio as gr
 import pandas as pd
@@ -17,89 +18,167 @@ import pandas as pd
 from ui_common import Panel, backend_for, serve
 from visual_prompt_guidance import HeadTrainer
 from visual_prompt_guidance.config import profile_settings, config_path, save_profile
-from visual_prompt_guidance.runtime import build_engine, model_options, train_config
+from visual_prompt_guidance.runtime import build_engine, model_options, train_config, resolve_training_precision
 from visual_prompt_guidance.experiments import create_run_dir, save_run_config, save_training_reports
 
 
-def train_stream(dataset_file, *values, panel: Panel):
-    """A Gradio generator streams events while the synchronous trainer runs in a worker.
+class _StepStatusObserver:
+    """Progress-only observer: never copies maps or tensors to the UI."""
+    wants_maps = False
+    wants_scores = False
 
-    HeadTrainer remains UI-agnostic; it invokes a plain progress callback.
-    No model or tensors are sent through Queue, only scalar diagnostic values.
+    def __init__(self, notify, *, steps: int):
+        self.notify = notify
+        self.steps = steps
+
+    def step(self, event):
+        self.notify(f"Denoising step {event.index + 1}/{self.steps} completed")
+
+    def end(self, result):
+        self.notify("Denoising and image decoding completed")
+
+
+def train_stream(dataset_file, *values, panel: Panel):
+    """Stream stage updates, denoising progress and optimizer metrics.
+
+    A long model load or second-order backward must never leave the UI silent.
+    The worker owns compute; this generator owns only scalar UI updates.
     """
-    settings=panel.settings(*values)
-    location=str(dataset_file or settings['dataset_path'] or '').strip()
-    if not location:
-        raise gr.Error('Provide a dataset ZIP, folder, or manifest.json')
-    settings['dataset_path']=location
-    settings['head_mode']='Learned'
-    if settings['guide_steps'] < 1:
-        raise gr.Error('Training requires at least one guided step')
-    panel.save(*values)
-    # The uploaded ZIP path is transient; do not persist it as the permanent dataset path.
-    if not dataset_file:
-        save_profile('train',{'dataset_path':location})
-    folder=create_run_dir('train')
-    path=folder/'learned_heads.json'
-    history=folder/'history.json'
-    train_cfg,image_cfg=train_config(settings,path,history)
-    options=model_options(settings)
-    save_run_config(folder,{'workflow':'train','source':'ui_training',
-        'config_source':str(config_path()),'settings':settings,
-        'model_options':options,'train_config':asdict(train_cfg),
-        'image_loss':asdict(image_cfg),'dataset':location})
-    events: Queue=Queue(maxsize=32)
+    started = time.monotonic()
+    untouched = (gr.update(), gr.update(), gr.update())
+    print('[VPG training] Train requested; validating configuration', flush=True)
+    # Yield before synchronous setup so Gradio can acknowledge the button click.
+    yield (*untouched, 'Preparing training configuration…', '')
+
+    try:
+        settings = panel.settings(*values)
+        requested_dtype = settings["dtype"]
+        settings = resolve_training_precision(settings)
+        location = str(dataset_file or settings['dataset_path'] or '').strip()
+        if not location:
+            raise ValueError('Provide a dataset ZIP, folder, or manifest.json')
+        settings['dataset_path'] = location
+        settings['head_mode'] = 'Learned'
+        if settings['guide_steps'] < 1:
+            raise ValueError('Training requires at least one guided step')
+        panel.save(*values)
+        if not dataset_file:
+            save_profile('train', {'dataset_path': location})
+        folder = create_run_dir('train')
+        path = folder / 'learned_heads.json'
+        history = folder / 'history.json'
+        train_cfg, image_cfg = train_config(settings, path, history)
+        options = model_options(settings)
+        save_run_config(folder, {
+            'workflow': 'train', 'source': 'ui_training',
+            'config_source': str(config_path()), 'settings': settings,
+            'model_options': options, 'train_config': asdict(train_cfg),
+            'image_loss': asdict(image_cfg), 'dataset': location,
+        })
+    except Exception as exc:
+        print(f'[VPG training] Configuration failed: {exc}', flush=True)
+        yield (*untouched, f'**Training setup failed:** {exc}', '')
+        return
+
+    events = Queue()  # Unbounded scalar-only queue: never block the GPU on UI rendering.
+    records = []
+    log_file = folder / 'training.log'
+
+    def notify(message):
+        print(f'[VPG training] {message}', flush=True)
+        with log_file.open('a', encoding='utf-8') as handle:
+            handle.write(f'{message}\n')
+        events.put(('status', message))
 
     def worker():
         try:
-            trainer=HeadTrainer(build_engine(settings,training=True,
-                                             backend=backend_for(settings)),
-                                config=train_cfg,image_loss=image_cfg)
-            def on_progress(count,total,event):
-                # The trainer callback is invoked after optimizer.step().
-                policy=trainer.engine.policy
+            notify(f'Run folder: {folder}')
+            if requested_dtype != settings["dtype"]:
+                notify(f'Training dtype auto resolved to {settings["dtype"]} on MPS (higher-order gradients)')
+            if train_cfg.detect_anomaly:
+                notify("Autograd anomaly detection enabled (slow): tracing the first invalid backward op")
+            notify('Creating backend and engine (model weights load on first sample)')
+            engine = build_engine(settings, training=True, backend=backend_for(settings))
+            engine.observers = (*engine.observers, _StepStatusObserver(notify, steps=int(settings['steps'])))
+            trainer = HeadTrainer(engine, config=train_cfg, image_loss=image_cfg)
+
+            def on_progress(count, total, event):
+                policy = trainer.engine.policy
                 import torch
                 with torch.no_grad():
-                    weights=policy.weights(policy.labels,device=policy.logits.device).detach().float()
-                    positive=weights[weights>0]
-                    peak=float(positive.max().cpu())
-                    entropy=float((-positive*positive.log()).sum().cpu())
-                events.put(('progress',{'step':count,'total':total,
-                                        'loss':float(event['loss']),
-                                        'grad_norm':float(event['grad_norm']),
-                                        'max_head_weight':peak,
-                                        'head_entropy':entropy,
-                                        'epoch':event['epoch']}))
-            result=trainer.fit(location,options=options,progress=on_progress)
-            save_training_reports(folder,result.history,result.head_labels,result.weights)
-            save_profile('train',{'learned_checkpoint':result.checkpoint})
-            events.put(('done',result))
-        except BaseException as error:
-            events.put(('error',f'{type(error).__name__}: {error}\n{traceback.format_exc(limit=4)}'))
+                    weights = policy.weights(policy.labels, device=policy.logits.device).detach().float()
+                    positive = weights[weights > 0]
+                    peak = float(positive.max().cpu())
+                    entropy = float((-positive * positive.log()).sum().cpu())
+                payload = {
+                    'step': count, 'total': total,
+                    'loss': float(event['loss']),
+                    'grad_norm': float(event['grad_norm']),
+                    'max_head_weight': peak,
+                    'head_entropy': entropy,
+                    'epoch': event['epoch'],
+                }
+                print(f"[VPG training] Update {count}/{total}: "
+                      f"loss={payload['loss']:.6f} grad={payload['grad_norm']:.5g} "
+                      f"max_weight={peak:.4f}", flush=True)
+                with log_file.open('a', encoding='utf-8') as handle:
+                    handle.write(f"Update {count}/{total}: loss={payload['loss']:.6f} "
+                                 f"grad={payload['grad_norm']:.5g} max_weight={peak:.4f}\n")
+                events.put(('progress', payload))
 
-    thread=Thread(target=worker,name='vpg-training',daemon=True)
+            result = trainer.fit(location, options=options, progress=on_progress, stage=notify)
+            notify('Preparing training plots and reports')
+            save_training_reports(folder, result.history, result.head_labels, result.weights)
+            save_profile('train', {'learned_checkpoint': result.checkpoint})
+            events.put(('done', result))
+        except BaseException as exc:
+            message = f'{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=8)}'
+            print(f'[VPG training] FAILED: {message}', flush=True)
+            with log_file.open('a', encoding='utf-8') as handle:
+                handle.write(f'FAILED: {message}\n')
+            events.put(('error', message))
+
+    thread = Thread(target=worker, name='vpg-training', daemon=True)
     thread.start()
-    records=[]
-    empty=pd.DataFrame(columns=['step','loss','grad_norm','max_head_weight'])
-    yield empty,empty,empty,f'Run started: `{folder}`. Loading model / dataset…',''
+    last_status = f'Run started: `{folder}` · initializing'
+    yield (*untouched, last_status, '')
+
+    # There may be no optimizer update for minutes during model loading/backward.
+    # Timed reads make progress visible even when training is computationally busy.
     while True:
-        kind,payload=events.get()
-        if kind=='progress':
+        try:
+            kind, payload = events.get(timeout=5)
+        except Empty:
+            elapsed = int(time.monotonic() - started)
+            if not thread.is_alive():
+                message = 'Worker stopped without reporting a result; check training.log'
+                print(f'[VPG training] {message}', flush=True)
+                yield (*untouched, f'**Training stopped:** {message} · `{folder}`', '')
+                break
+            print(f'[VPG training] Still running: {last_status} ({elapsed}s elapsed)', flush=True)
+            yield (*untouched, f'{last_status} · {elapsed}s elapsed (working)', '')
+            continue
+
+        if kind == 'status':
+            last_status = str(payload)
+            yield (*untouched, f'{last_status} · `{folder}`', '')
+        elif kind == 'progress':
             records.append(payload)
-            df=pd.DataFrame.from_records(records)
-            status=f"Iteration {payload['step']}/{payload['total']} · epoch {payload['epoch']} · image loss {payload['loss']:.6f} · max head weight {payload['max_head_weight']:.4f}"
-            yield df,df,df,status,''
-        elif kind=='done':
-            result=payload
-            status=(f'**Completed:** {len(result.history)} optimizer updates. '
-                    f'Final loss: {result.history[-1]["loss"]:.6f}. '
-                    f'Run folder: `{folder}`.')
-            df=pd.DataFrame.from_records(records) if records else empty
-            yield df,df,df,status,result.checkpoint
+            df = pd.DataFrame.from_records(records)
+            last_status = (f"Update {payload['step']}/{payload['total']} · epoch {payload['epoch']} · "
+                           f"image loss {payload['loss']:.6f} · max head weight {payload['max_head_weight']:.4f}")
+            yield df, df, df, last_status, ''
+        elif kind == 'done':
+            result = payload
+            df = pd.DataFrame.from_records(records)
+            last_loss = result.history[-1]['loss'] if result.history else float('nan')
+            notify_done = (f'Completed: {len(result.history)} optimizer updates; '
+                           f'final loss {last_loss:.6f}; checkpoint {result.checkpoint}')
+            print(f'[VPG training] {notify_done}', flush=True)
+            yield df, df, df, f'**{notify_done}** · `{folder}`', result.checkpoint
             break
-        else:
-            df=pd.DataFrame.from_records(records) if records else empty
-            yield df,df,df,f'**Training failed:** {payload}\nRun folder: `{folder}`',''
+        elif kind == 'error':
+            yield (*untouched, f'**Training failed:**\n```text\n{payload}\n```\nSee `{log_file}`', '')
             break
 
 
@@ -109,9 +188,7 @@ def build_demo():
         gr.Markdown('## Visual Prompt Guidance · Training\n'
                     'Train head weights against ground-truth edits. The pretrained generator is frozen. '
                     'Plots update **after each training sample**.')
-        with gr.Row():
-            save_btn=gr.Button('Save training settings')
-            load_btn=gr.Button('Restore training settings')
+        save_btn=gr.Button('Save training settings', size='sm')
         status=gr.Markdown(f'Config: `{config_path()}` · Train profile')
         with gr.Row():
             dataset_file=gr.File(label='Dataset ZIP (optional)',file_types=['.zip'],type='filepath')
@@ -126,17 +203,19 @@ def build_demo():
                 train_components['optimizer_name']=gr.Dropdown(['adamw','adam','sgd'],value=init['optimizer_name'],label='Optimizer')
                 train_components['weight_decay']=gr.Number(value=init['weight_decay'],label='Weight decay')
             with gr.Row():
-                train_components['image_loss_name']=gr.Dropdown(['l1','mse','charbonnier','smooth_l1'],
-                    value=init['image_loss_name'],label='Image loss')
-                train_components['inside_weight']=gr.Number(value=init['inside_weight'],label='Edit-region weight')
-                train_components['outside_weight']=gr.Number(value=init['outside_weight'],label='Background weight')
-                train_components['lpips_weight']=gr.Number(value=init['lpips_weight'],label='LPIPS weight')
+                train_components['edit_loss_name']=gr.Dropdown(['l1','mse','charbonnier','smooth_l1','lpips'],
+                    value=init['edit_loss_name'],label='Edit loss')
+                train_components['edit_loss_weight']=gr.Number(value=init['edit_loss_weight'],label='Edit weight')
+                train_components['background_loss_name']=gr.Dropdown(['l1','mse','charbonnier','smooth_l1','lpips'],
+                    value=init['background_loss_name'],label='Background loss')
+                train_components['background_loss_weight']=gr.Number(value=init['background_loss_weight'],label='Background weight')
                 train_components['grad_clip']=gr.Number(value=init['grad_clip'],label='Gradient clipping')
         panel=Panel('train',training=True)
         panel.add('dataset_path',dataset_path)
         for key,comp in train_components.items():
             panel.add(key,comp)
-        panel.connect_presets(save_button=save_btn,load_button=load_btn,status=status)
+        panel.connect_save(save_btn,status)
+        panel.connect_autoload(demo)
         train_button=gr.Button('Train head weights',variant='primary')
         progress_status=gr.Markdown('')
         checkpoint=gr.Textbox(label='Saved checkpoint (usable in Inference)',interactive=False)
@@ -147,10 +226,25 @@ def build_demo():
                                      x_title='Optimizer update',y_title='Norm',height=300)
         weight_plot=gr.LinePlot(x='step',y='max_head_weight',title='Largest individual head weight',
                                 x_title='Optimizer update',y_title='Weight',height=250)
-        train_button.click(lambda file,*vals: train_stream(file,*vals,panel=panel),
-             [dataset_file,*panel.components],
-             [loss_plot,gradient_plot,weight_plot,progress_status,checkpoint],
-             concurrency_limit=1,show_progress='minimal')
+        # Gradio must receive a generator *function* for streaming. A lambda
+        # returning train_stream(...) is not recognized as a generator callback;
+        # Gradio instead treats the generator object as a single output.
+        def run_training(file, *vals):
+            yield from train_stream(file, *vals, panel=panel)
+
+        # A no-input, non-queued acknowledgement updates the UI immediately,
+        # even if another queued Gradio event (e.g. metadata discovery) is slow.
+        def acknowledge_training():
+            print('[VPG training] Train button clicked; submitting job', flush=True)
+            return 'Training requested · starting worker…', ''
+
+        accepted = train_button.click(
+            acknowledge_training, inputs=[], outputs=[progress_status, checkpoint],
+            queue=False, show_progress='hidden')
+        accepted.then(
+            run_training, [dataset_file, *panel.components],
+            [loss_plot, gradient_plot, weight_plot, progress_status, checkpoint],
+            concurrency_limit=1, show_progress='minimal')
     return demo
 
 

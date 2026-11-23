@@ -22,10 +22,22 @@ class Guidance:
 
 
 def rms_update(latent: torch.Tensor, gradient: torch.Tensor, cfg: Guidance) -> tuple[torch.Tensor, float]:
-    rms = gradient.float().square().mean().sqrt()
-    scale = rms.clamp_min(1e-8) if cfg.normalize_gradient else 1.0
-    updated = latent.float() - cfg.strength * gradient.float() / scale
-    return updated.to(dtype=latent.dtype), float(rms.detach().item())
+    """Latent guidance with stable higher-order derivatives at zero gradient.
+
+    Clamping *after* sqrt() produces NaN second-order gradients at exactly
+    zero RMS (sqrt'(0) is infinite, yielding 0 * inf during backward).
+    Regularize the squared RMS before sqrt so both the normalized update and
+    its derivative remain finite; do not detach the normalization term.
+    """
+    g = gradient.float()
+    if not bool(torch.isfinite(g).all().item()):
+        raise FloatingPointError("Non-finite inner guidance gradient (before latent update)")
+    mean_square = g.square().mean()
+    scale = mean_square.clamp_min(1e-16).sqrt() if cfg.normalize_gradient else 1.0
+    updated = latent.float() - cfg.strength * g / scale
+    # Monitoring should report the actual RMS (zero is a valid measurement).
+    observed_rms = float(mean_square.detach().sqrt().item())
+    return updated.to(dtype=latent.dtype), observed_rms
 
 
 class Engine:

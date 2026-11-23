@@ -8,16 +8,35 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import losses
-from .engine import Engine, Guidance
+from .engine import Engine, Guidance, rms_update
 from .objectives import Objective, Loss
 from .heads import Uniform, Adaptive, Manual, Learned, HeadSubset
 from .transforms import AffinityGrow
+from .observers import FileObserver
 
 MODEL_ALIASES = {"pix2pix": "InstructPix2Pix", "flux2": "FLUX.2 Klein"}
 
 
 def canonical_model(value: str) -> str:
     return MODEL_ALIASES.get(value, value)
+
+
+def resolve_training_precision(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve 'auto' to FP32 on Apple MPS for higher-order derivatives.
+
+    This is an *effective runtime* configuration, not an implicit update to the
+    user's persisted preferences. Explicit dtype choices are respected.
+    Inference keeps its existing autocasting behavior.
+    """
+    effective = dict(settings)
+    if effective.get('dtype', 'auto') != 'auto':
+        return effective
+    import torch
+    device = effective.get('device', 'auto')
+    if device == 'mps' or (device == 'auto' and not torch.cuda.is_available()
+                            and torch.backends.mps.is_available()):
+        effective['dtype'] = 'fp32'
+    return effective
 
 
 def build_backend(settings: Mapping[str, Any]):
@@ -33,10 +52,22 @@ def build_backend(settings: Mapping[str, Any]):
     raise ValueError(f"Unknown model {model!r}")
 
 
-def build_objective(settings: Mapping[str, Any]) -> Objective:
-    names = settings["selected_losses"]
+def build_loss_objective(names, settings: Mapping[str, Any]) -> Objective:
+    unknown = set(names) - set(losses.BUILTIN_LOSSES)
+    if unknown:
+        raise ValueError(f"Unknown guidance/scoring losses: {sorted(unknown)}")
     return Objective(*(Loss(name, losses.BUILTIN_LOSSES[name],
                             weight=float(settings[f"{name}_w"])) for name in names))
+
+
+def build_objective(settings: Mapping[str, Any]) -> Objective:
+    return build_loss_objective(settings["selected_losses"], settings)
+
+
+def build_scoring(settings: Mapping[str, Any]) -> Objective | None:
+    """No separate scoring losses = the engine uses the guidance objective."""
+    names = settings.get("scoring_losses") or []
+    return build_loss_objective(names, settings) if names else None
 
 
 def parse_manual_weights(rows) -> dict[str, float]:
@@ -95,13 +126,18 @@ def build_guidance(settings: Mapping[str, Any], policy=None) -> Guidance:
     return Guidance(
         strength=float(settings["strength"]), max_steps=int(settings["guide_steps"]),
         layers=layers or None,
-        affinity_layers=tuple(settings.get("propagation_layers") or ()) or None,
+        affinity_layers=(tuple(settings.get("propagation_layers") or ()) or None)
+                        if settings.get("use_propagation") else None,
+        normalize_gradient=bool(settings.get("normalize_gradient", True)),
     )
 
 
 def build_transform(settings: Mapping[str, Any]):
     if not settings.get("use_propagation"):
         return None
+    algorithm = settings.get("propagation_algorithm", "affinity_grow")
+    if algorithm != "affinity_grow":
+        raise ValueError(f"Unknown propagation algorithm {algorithm!r}")
     return AffinityGrow(
         start=int(settings["propagation_start"]), stop=int(settings["propagation_stop"]),
         limit=int(settings["propagation_limit"]), threshold=float(settings["propagation_threshold"]),
@@ -122,12 +158,29 @@ def model_options(settings: Mapping[str, Any]) -> dict[str, Any]:
     return options
 
 
+UPDATERS = {"rms": rms_update}
+
+
+def build_observers(settings: Mapping[str, Any], folder) -> list:
+    """Shared export configuration for CLI and Inference UI."""
+    interval = int(settings.get("observer_interval", 3))
+    if interval < 1:
+        raise ValueError("observer_interval must be positive")
+    return [FileObserver(folder, maps=bool(settings["save_maps"]),
+                         images=bool(settings["save_maps"]), interval=interval)]
+
+
 def build_engine(settings: Mapping[str, Any], *, training: bool = False,
                  backend=None, observers=()) -> Engine:
     policy = build_policy(settings, training=training)
+    update_name = settings.get("updater", "rms")
+    if update_name not in UPDATERS:
+        raise ValueError(f"Unknown latent updater {update_name!r}")
     return Engine(backend if backend is not None else build_backend(settings),
                   build_objective(settings), guidance=build_guidance(settings, policy),
-                  policy=policy, transform=build_transform(settings), observers=observers)
+                  policy=policy, scoring=build_scoring(settings),
+                  transform=build_transform(settings), observers=observers,
+                  updater=UPDATERS[update_name])
 
 
 def train_config(settings: Mapping[str, Any], checkpoint: Path, history: Path):
@@ -137,9 +190,10 @@ def train_config(settings: Mapping[str, Any], checkpoint: Path, history: Path):
                     learning_rate=float(settings["learning_rate"]),
                     optimizer=settings["optimizer_name"], weight_decay=float(settings["weight_decay"]),
                     grad_clip=float(settings["grad_clip"]),
+                    detect_anomaly=bool(settings.get("train_debug_autograd", False)),
                     checkpoint=str(checkpoint), history=str(history)),
-        ImageLossConfig(pixel=settings["image_loss_name"],
-                        inside_weight=float(settings["inside_weight"]),
-                        outside_weight=float(settings["outside_weight"]),
-                        lpips_weight=float(settings["lpips_weight"])),
+        ImageLossConfig(edit_loss=settings["edit_loss_name"],
+                        edit_weight=float(settings["edit_loss_weight"]),
+                        background_loss=settings["background_loss_name"],
+                        background_weight=float(settings["background_loss_weight"])),
     )

@@ -8,7 +8,7 @@ import argparse
 from pathlib import Path
 
 from visual_prompt_guidance.config import resolve_settings, save_profile, config_path
-from visual_prompt_guidance.runtime import build_engine, canonical_model, model_options, train_config
+from visual_prompt_guidance.runtime import build_engine, canonical_model, model_options, train_config, resolve_training_precision
 from visual_prompt_guidance import HeadTrainer, losses
 from visual_prompt_guidance.experiments import create_run_dir, save_run_config, save_training_reports
 
@@ -38,10 +38,10 @@ def make_parser():
     p.add_argument("--optimizer", choices=["adamw", "adam", "sgd"], default=None)
     p.add_argument("--grad-clip", type=float, default=None)
     p.add_argument("--weight-decay", type=float, default=None)
-    p.add_argument("--loss", choices=["l1", "mse", "charbonnier", "smooth_l1"], default=None)
-    p.add_argument("--inside-weight", type=float, default=None)
-    p.add_argument("--outside-weight", type=float, default=None)
-    p.add_argument("--lpips-weight", type=float, default=None)
+    p.add_argument("--edit-loss", choices=["l1", "mse", "charbonnier", "smooth_l1", "lpips"], default=None)
+    p.add_argument("--edit-weight", type=float, default=None)
+    p.add_argument("--background-loss", choices=["l1", "mse", "charbonnier", "smooth_l1", "lpips"], default=None)
+    p.add_argument("--background-weight", type=float, default=None)
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--text-cfg", type=float, default=None)
     p.add_argument("--image-cfg", type=float, default=None)
@@ -66,9 +66,10 @@ def settings_from_args(args):
         "max_side": "max_side", "seed": "seed", "layer": "selected_layers",
         "head": "selected_heads", "guidance_loss": "selected_losses",
         "epochs": "training_epochs", "lr": "learning_rate", "optimizer": "optimizer_name",
-        "grad_clip": "grad_clip", "weight_decay": "weight_decay", "loss": "image_loss_name",
-        "inside_weight": "inside_weight", "outside_weight": "outside_weight",
-        "lpips_weight": "lpips_weight", "temperature": "learned_temperature",
+        "grad_clip": "grad_clip", "weight_decay": "weight_decay",
+        "edit_loss": "edit_loss_name", "edit_weight": "edit_loss_weight",
+        "background_loss": "background_loss_name", "background_weight": "background_loss_weight",
+        "temperature": "learned_temperature",
         "image_cfg": "pix_image_cfg", "flux_mode": "flux_mode",
         "inpaint_strength": "flux_inpaint_strength", "use_propagation": "use_propagation",
         "affinity_layer": "propagation_layers", "propagation_start": "propagation_start",
@@ -95,6 +96,10 @@ def main(argv=None):
     overrides = settings_from_args(args)
     overrides["head_mode"] = "Learned"  # This CLI always trains Learned policies.
     settings = resolve_settings("train", overrides, path=args.config)
+    requested_dtype = settings["dtype"]
+    settings = resolve_training_precision(settings)
+    if requested_dtype != settings["dtype"]:
+        print("[VPG training] MPS automatic precision resolved to fp32 for second-order gradients", flush=True)
     dataset = settings["dataset_path"]
     if not dataset:
         parser.error("Dataset not configured: pass --dataset or set train.dataset_path in project config")

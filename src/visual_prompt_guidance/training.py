@@ -34,6 +34,7 @@ class TrainConfig:
     optimizer: str = "adamw"  # adam, adamw, sgd
     weight_decay: float = 0.0
     grad_clip: float = 1.0
+    detect_anomaly: bool = False  # Diagnostic only: record the first NaN-producing autograd op.
     shuffle: bool = True
     shuffle_seed: int = 42
     checkpoint: str = "outputs/learned_heads.json"
@@ -50,20 +51,82 @@ class TrainConfig:
             raise ValueError("grad_clip must be nonnegative and finite")
 
 
+class RegionLoss:
+    """Plugin interface for a region-aware training loss."""
+    def __call__(self, predicted: torch.Tensor, target: torch.Tensor,
+                 mask: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class PixelRegionLoss(RegionLoss):
+    def __init__(self, mode: str):
+        self.mode = mode
+
+    def __call__(self, predicted: torch.Tensor, target: torch.Tensor,
+                 mask: torch.Tensor) -> torch.Tensor:
+        pred = predicted.float()
+        tgt = target.float()
+        if self.mode == "l1":
+            values = (pred - tgt).abs()
+        elif self.mode == "mse":
+            values = (pred - tgt).square()
+        elif self.mode == "charbonnier":
+            values = ((pred - tgt).square() + 1e-6).sqrt()
+        elif self.mode == "smooth_l1":
+            values = F.smooth_l1_loss(pred, tgt, reduction="none")
+        else:
+            raise ValueError(f"Unknown pixel region loss {self.mode!r}")
+        values = values.mean(1, keepdim=True)
+        return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+class MaskedLpipsRegionLoss(RegionLoss):
+    def __init__(self):
+        self._lpips = None
+
+    def __call__(self, predicted: torch.Tensor, target: torch.Tensor,
+                 mask: torch.Tensor) -> torch.Tensor:
+        if self._lpips is None:
+            try:
+                import lpips
+            except ImportError as error:
+                raise ImportError("pip install lpips to use the lpips training loss") from error
+            self._lpips = lpips.LPIPS(net="alex").eval().requires_grad_(False)
+        network = self._lpips.to(device=predicted.device)
+        pred = predicted.float() * mask
+        tgt = target.float() * mask
+        return network(pred * 2 - 1, tgt * 2 - 1).mean()
+
+
+IMAGE_LOSS_REGISTRY: dict[str, Callable[[], RegionLoss]] = {
+    "l1": lambda: PixelRegionLoss("l1"),
+    "mse": lambda: PixelRegionLoss("mse"),
+    "charbonnier": lambda: PixelRegionLoss("charbonnier"),
+    "smooth_l1": lambda: PixelRegionLoss("smooth_l1"),
+    "lpips": MaskedLpipsRegionLoss,
+}
+
+
+def register_image_loss(name: str, factory: Callable[[], RegionLoss]) -> None:
+    if not isinstance(name, str) or not name:
+        raise ValueError("Image loss name must be a non-empty string")
+    IMAGE_LOSS_REGISTRY[name] = factory
+
+
 @dataclass(frozen=True)
 class ImageLossConfig:
-    pixel: str = "l1"             # l1, mse, charbonnier, smooth_l1
-    inside_weight: float = 1.0    # reconstruction inside the edited region
-    outside_weight: float = 1.0   # preserve the unedited region
-    lpips_weight: float = 0.0     # optional global learned perceptual loss
+    edit_loss: str = "l1"
+    edit_weight: float = 1.0
+    background_loss: str = "l1"
+    background_weight: float = 1.0
 
     def __post_init__(self):
-        if self.pixel not in {"l1", "mse", "charbonnier", "smooth_l1"}:
-            raise ValueError("Unknown image pixel loss")
-        if any(not math.isfinite(x) or x < 0 for x in
-               (self.inside_weight, self.outside_weight, self.lpips_weight)):
+        for name in (self.edit_loss, self.background_loss):
+            if name not in IMAGE_LOSS_REGISTRY:
+                raise ValueError(f"Unknown image loss {name!r}")
+        if any(not math.isfinite(x) or x < 0 for x in (self.edit_weight, self.background_weight)):
             raise ValueError("Image loss weights must be finite and nonnegative")
-        if self.inside_weight + self.outside_weight + self.lpips_weight <= 0:
+        if self.edit_weight + self.background_weight <= 0:
             raise ValueError("Select at least one positive image loss weight")
 
 
@@ -212,7 +275,8 @@ class ImageObjective:
     """Differentiable image-level supervision, independent of the guidance loss."""
     def __init__(self, config: ImageLossConfig):
         self.config = config
-        self._lpips = None
+        self.edit_loss = IMAGE_LOSS_REGISTRY[config.edit_loss]()
+        self.background_loss = IMAGE_LOSS_REGISTRY[config.background_loss]()
 
     def __call__(self, predicted: torch.Tensor, example: TrainingExample,
                  projected_mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
@@ -230,31 +294,14 @@ class ImageObjective:
             mask = F.interpolate(projected_mask.to(device=predicted.device, dtype=torch.float32),
                                  size=predicted.shape[-2:], mode="nearest")
         mask = mask.clamp(0, 1)
-        if self.config.pixel == "l1":
-            pixel_loss = (predicted.float() - target).abs()
-        elif self.config.pixel == "mse":
-            pixel_loss = (predicted.float() - target).square()
-        elif self.config.pixel == "charbonnier":
-            pixel_loss = ((predicted.float() - target).square() + 1e-6).sqrt()
-        else:
-            pixel_loss = F.smooth_l1_loss(predicted.float(), target, reduction="none")
-        pixel_loss = pixel_loss.mean(1, keepdim=True)
-        inside = (pixel_loss * mask).sum() / mask.sum().clamp_min(1.0)
-        outside_mask = 1 - mask
-        outside = (pixel_loss * outside_mask).sum() / outside_mask.sum().clamp_min(1.0)
-        total = self.config.inside_weight * inside + self.config.outside_weight * outside
-        parts = {"inside": float(inside.detach()), "outside": float(outside.detach())}
-        if self.config.lpips_weight > 0:
-            if self._lpips is None:
-                try:
-                    import lpips
-                except ImportError as error:
-                    raise ImportError("pip install lpips to use lpips_weight > 0") from error
-                self._lpips = lpips.LPIPS(net="alex").eval().requires_grad_(False)
-            network = self._lpips.to(device=predicted.device)
-            perceptual = network(predicted.float() * 2 - 1, target * 2 - 1).mean()
-            total = total + self.config.lpips_weight * perceptual
-            parts["lpips_global"] = float(perceptual.detach())
+        outside_mask = (1 - mask).clamp(0, 1)
+        inside = self.edit_loss(predicted, target, mask)
+        outside = self.background_loss(predicted, target, outside_mask)
+        total = self.config.edit_weight * inside + self.config.background_weight * outside
+        parts = {
+            f'edit/{self.config.edit_loss}': float(inside.detach()),
+            f'background/{self.config.background_loss}': float(outside.detach()),
+        }
         return total, parts
 
 
@@ -281,37 +328,62 @@ class HeadTrainer:
         self.criterion = ImageObjective(image_loss)
 
     def fit(self, dataset_path: str | Path, *, options: Mapping[str, Any] | None = None,
-            progress: Callable[[int, int, dict[str, Any]], None] | None = None) -> TrainResult:
+            progress: Callable[[int, int, dict[str, Any]], None] | None = None,
+            stage: Callable[[str], None] | None = None) -> TrainResult:
         policy: Learned = self.engine.policy
         optimizer = None
         history: list[dict[str, Any]] = []
         config = self.config
+        if stage is not None:
+            stage("Reading training dataset")
         with EditingDataset(dataset_path, options=options) as dataset:
             total_items = config.epochs * len(dataset)
+            if stage is not None:
+                stage(f"Dataset ready: {len(dataset)} samples, {config.epochs} epochs, {total_items} updates")
             for epoch in range(config.epochs):
                 order = list(range(len(dataset)))
                 if config.shuffle:
                     random.Random(config.shuffle_seed + epoch).shuffle(order)
                 for sample_index in order:
+                    if stage is not None:
+                        stage(f"Sample {len(history) + 1}/{total_items} (epoch {epoch + 1}): loading images")
                     example = dataset[sample_index]
-                    result = self.engine.run_differentiable(example.request, example.visual)
-                    if policy.logits is None:
-                        raise RuntimeError("No head weights initialized; require at least one guided step")
-                    if optimizer is None:
-                        name = config.optimizer.lower()
-                        optimizer_type = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW,
-                                          "sgd": torch.optim.SGD}[name]
-                        optimizer = optimizer_type([policy.logits], lr=config.learning_rate,
-                                                    weight_decay=config.weight_decay)
-                    optimizer.zero_grad(set_to_none=True)
-                    image_loss, parts = self.criterion(result.output, example, result.target.edit_mask)
-                    if not bool(torch.isfinite(image_loss).item()):
-                        raise RuntimeError("Non-finite outer image loss")
-                    image_loss.backward()
+                    if stage is not None:
+                        stage(f"Sample {len(history) + 1}/{total_items}: preparing model and denoising")
+                    # Anomaly mode must cover forward *and* backward to provide
+                    # the forward traceback of the first NaN-producing op.
+                    # Off by default: autograd anomaly detection is expensive.
+                    with torch.autograd.set_detect_anomaly(config.detect_anomaly, check_nan=True):
+                        result = self.engine.run_differentiable(example.request, example.visual)
+                        if stage is not None:
+                            stage(f"Sample {len(history) + 1}/{total_items}: forward complete; computing image loss")
+                        if policy.logits is None:
+                            raise RuntimeError("No head weights initialized; require at least one guided step")
+                        if optimizer is None:
+                            name = config.optimizer.lower()
+                            optimizer_type = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW,
+                                              "sgd": torch.optim.SGD}[name]
+                            optimizer = optimizer_type([policy.logits], lr=config.learning_rate,
+                                                        weight_decay=config.weight_decay)
+                        optimizer.zero_grad(set_to_none=True)
+                        image_loss, parts = self.criterion(result.output, example, result.target.edit_mask)
+                        if not bool(torch.isfinite(image_loss).item()):
+                            raise RuntimeError("Non-finite outer image loss")
+                        if stage is not None:
+                            stage(f"Sample {len(history) + 1}/{total_items}: backpropagating through denoising")
+                        image_loss.backward()
                     if policy.logits.grad is None:
                         raise RuntimeError("Outer image loss did not reach learned head logits")
                     if not bool(torch.isfinite(policy.logits.grad).all().item()):
-                        raise RuntimeError("Non-finite learned-head gradient")
+                        nan_count = int(torch.isnan(policy.logits.grad).sum().item())
+                        inf_count = int(torch.isinf(policy.logits.grad).sum().item())
+                        raise RuntimeError(
+                            f"Non-finite learned-head gradient: {nan_count} NaN and "
+                            f"{inf_count} Inf among {policy.logits.grad.numel()} heads; "
+                            f"image loss={float(image_loss.detach()):.6g}. "
+                            "The optimizer was not stepped. Try fewer denoising/guided "
+                            "steps and float32; inspect the inner guidance updater."
+                        )
                     gradient_norm = float(policy.logits.grad.norm().detach().item())
                     if config.grad_clip:
                         torch.nn.utils.clip_grad_norm_([policy.logits], config.grad_clip)
@@ -326,6 +398,8 @@ class HeadTrainer:
                         progress(len(history), total_items, record)
                     # Do not retain any output tensors/graphs beyond one example.
                     del image_loss, result
+        if stage is not None:
+            stage("Saving trained head weights and history")
         policy.save(config.checkpoint)
         hist = Path(config.history)
         hist.parent.mkdir(parents=True, exist_ok=True)

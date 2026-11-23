@@ -20,21 +20,26 @@ LEGACY_CONFIG_PATH = Path("configs/ui_settings.json")
 DEFAULT_SETTINGS: dict[str, Any] = {
     "tool": "Scribble", "prompt": "Insert a dog", "object_name": "dog", "model": "InstructPix2Pix",
     "device": "auto", "dtype": "auto", "model_id": None,
-    "selected_losses": ["coverage"],
+    "selected_losses": ["coverage"], "scoring_losses": [],
     "coverage_w": 1.0, "focal_w": 1.0, "moment_w": 1.0,
     "centerline_w": 1.0, "centroid_w": 1.0, "outside_w": 1.0,
     "steps": 30, "guide_steps": 10, "strength": 0.01, "seed": 42, "max_side": 256,
+    "normalize_gradient": True, "updater": "rms",
     "flux_mode": "base", "flux_inpaint_strength": 0.8, "flux_cfg": 4.0,
     "pix_text_cfg": 7.5, "pix_image_cfg": 1.5,
     "head_mode": "Uniform", "selected_layers": [], "selected_heads": [], "manual_rows": [],
     "adaptive_temperature": 0.01, "adaptive_ema": 0.5, "adaptive_mix": 0.1,
     "learned_checkpoint": "", "dataset_path": "", "learned_temperature": 1.0,
     "training_epochs": 1, "learning_rate": 0.001, "optimizer_name": "adamw", "weight_decay": 0.0,
+    "train_debug_autograd": False,
+    "edit_loss_name": "l1", "edit_loss_weight": 1.0,
+    "background_loss_name": "l1", "background_loss_weight": 1.0,
     "image_loss_name": "l1", "inside_weight": 1.0, "outside_weight": 1.0,
     "lpips_weight": 0.0, "grad_clip": 1.0,
-    "use_propagation": False, "propagation_layers": [], "propagation_start": 3,
+    "use_propagation": False, "propagation_algorithm": "affinity_grow",
+    "propagation_layers": [], "propagation_start": 3,
     "propagation_stop": 10, "propagation_limit": 12, "propagation_threshold": 0.2,
-    "propagation_max_fraction": 0.3, "save_maps": False,
+    "propagation_max_fraction": 0.3, "save_maps": False, "observer_interval": 3,
 }
 
 
@@ -78,7 +83,18 @@ def profile_settings(profile: str, *, path: str | Path | None = None) -> dict:
     if profile not in PROFILE_NAMES:
         raise ValueError(f"Unknown profile {profile!r}")
     settings = deepcopy(DEFAULT_SETTINGS)
-    settings.update(deepcopy(read_store(path)[profile]))
+    store_values = deepcopy(read_store(path)[profile])
+    settings.update(store_values)
+    # Backward compatibility: map the old monolithic image-loss fields into the
+    # new edit/background loss configuration when the new keys were not saved yet.
+    if "edit_loss_name" not in store_values:
+        settings["edit_loss_name"] = settings.get("image_loss_name", "l1")
+    if "edit_loss_weight" not in store_values:
+        settings["edit_loss_weight"] = settings.get("inside_weight", 1.0)
+    if "background_loss_name" not in store_values:
+        settings["background_loss_name"] = settings.get("image_loss_name", "l1")
+    if "background_loss_weight" not in store_values:
+        settings["background_loss_weight"] = settings.get("outside_weight", 1.0)
     return settings
 
 

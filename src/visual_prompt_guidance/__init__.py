@@ -7,7 +7,7 @@ from .objectives import Loss, Objective
 from .prompts import Point, Box, Scribble
 from .transforms import AffinityGrow
 from .observers import FileObserver
-from .training import TrainConfig, ImageLossConfig, EditingDataset, HeadTrainer, TrainResult
+from .training import TrainConfig, ImageLossConfig, EditingDataset, HeadTrainer, TrainResult, register_image_loss
 from . import losses
 
 __all__ = [
@@ -15,5 +15,5 @@ __all__ = [
     "StepEvent","Result","ModelAdapter","DifferentiableModelAdapter","VisualPrompt","Engine","Guidance",
     "rms_update","Uniform","Manual","Adaptive","Learned","HeadSubset","Loss","Objective","Point",
     "Box","Scribble","AffinityGrow","FileObserver","losses",
-    "TrainConfig","ImageLossConfig","EditingDataset","HeadTrainer","TrainResult",
+    "TrainConfig","ImageLossConfig","EditingDataset","HeadTrainer","TrainResult","register_image_loss",
 ]
