@@ -238,7 +238,18 @@ class Flux2Klein:
             and hidden.is_cuda
         )
 
-        def model_forward(model_input):
+        use_checkpoint = (
+            self.train_checkpoint_transformer
+            and torch.is_grad_enabled()
+            and hidden.requires_grad
+        )
+        per_block = (
+            use_checkpoint
+            and hasattr(pipe.transformer, "gradient_checkpointing")
+            and hasattr(pipe.transformer, "_gradient_checkpointing_func")
+        )
+
+        def run_transformer(model_input):
             collector = None
             if attention is not None:
                 collector = AttentionCollector(
@@ -246,15 +257,71 @@ class Flux2Klein:
                     self_blocks=self_blocks, capture_heads=True,
                     checkpoint_chunks=self.train_checkpoint_attention,
                 )
-            hooks = (collector.capture(text_len=text_len, capture_self=require_affinity)
-                     if collector is not None else nullcontext())
-            with _fresh_sdpa_context(math_attention), hooks:
-                with pipe.transformer.cache_context(cfg_label):
-                    pred = pipe.transformer(
-                        hidden_states=model_input, timestep=timestep, guidance=None,
-                        encoder_hidden_states=embeds, txt_ids=text_ids, img_ids=ids,
-                        joint_attention_kwargs=None, return_dict=False,
-                    )[0]
+            if per_block:
+                from torch.utils.checkpoint import checkpoint
+                if collector is not None:
+                    collector.prepare_capture(text_len=text_len, capture_self=require_affinity)
+                block_names = {
+                    **{id(b): f"D{i}" for i, b in enumerate(pipe.transformer.transformer_blocks)},
+                    **{id(b): f"S{i}" for i, b in enumerate(pipe.transformer.single_transformer_blocks)},
+                }
+                captured_names = set(blocks) | (set(self_blocks) if require_affinity else set())
+
+                def block_checkpoint(block, *args):
+                    name = block_names.get(id(block))
+                    if collector is None or name not in captured_names:
+                        def run_plain(*inner_args):
+                            with _fresh_sdpa_context(math_attention):
+                                return block(*inner_args)
+                        return checkpoint(run_plain, *args, use_reentrant=False)
+
+                    has_heads = name in collector.blocks
+                    has_self = name in collector._active_self_blocks
+
+                    def run_captured(*inner_args):
+                        with _fresh_sdpa_context(math_attention), collector.capture_block(name):
+                            out = block(*inner_args)
+                        collector.maps.pop(name, None)
+                        extras = []
+                        if has_heads:
+                            extras.append(collector.head_maps.pop(name))
+                        if has_self:
+                            extras.append(collector.self_maps.pop(name))
+                        return (*out, *extras) if isinstance(out, tuple) else (out, *extras)
+
+                    result = checkpoint(run_captured, *args, use_reentrant=False)
+                    n_extra = int(has_heads) + int(has_self)
+                    if has_self:
+                        collector.self_maps[name] = result[-1]
+                    if has_heads:
+                        collector.head_maps[name] = result[-1 - int(has_self)]
+                    block_out = result[:-n_extra]
+                    return block_out[0] if len(block_out) == 1 else block_out
+
+                prev_gc = pipe.transformer.gradient_checkpointing
+                prev_gc_fn = pipe.transformer._gradient_checkpointing_func
+                pipe.transformer.gradient_checkpointing = True
+                pipe.transformer._gradient_checkpointing_func = block_checkpoint
+                try:
+                    with pipe.transformer.cache_context(cfg_label):
+                        pred = pipe.transformer(
+                            hidden_states=model_input, timestep=timestep, guidance=None,
+                            encoder_hidden_states=embeds, txt_ids=text_ids, img_ids=ids,
+                            joint_attention_kwargs=None, return_dict=False,
+                        )[0]
+                finally:
+                    pipe.transformer.gradient_checkpointing = prev_gc
+                    pipe.transformer._gradient_checkpointing_func = prev_gc_fn
+            else:
+                hooks = (collector.capture(text_len=text_len, capture_self=require_affinity)
+                         if collector is not None else nullcontext())
+                with _fresh_sdpa_context(math_attention), hooks:
+                    with pipe.transformer.cache_context(cfg_label):
+                        pred = pipe.transformer(
+                            hidden_states=model_input, timestep=timestep, guidance=None,
+                            encoder_hidden_states=embeds, txt_ids=text_ids, img_ids=ids,
+                            joint_attention_kwargs=None, return_dict=False,
+                        )[0]
             pred = pred[:, :n_output]
             if collector is None:
                 return pred
@@ -264,13 +331,13 @@ class Flux2Klein:
                 return pred, heads, collector.mean_self_map()
             return pred, heads
 
-        if self.train_checkpoint_transformer and torch.is_grad_enabled() and hidden.requires_grad:
+        if use_checkpoint and not per_block:
             from torch.utils.checkpoint import checkpoint
             # Do not use sdpa_kernel as checkpoint(context_fn=...): the
             # recompute context can be re-entered by higher-order autograd.
-            outputs = checkpoint(model_forward, hidden, use_reentrant=False)
+            outputs = checkpoint(run_transformer, hidden, use_reentrant=False)
         else:
-            outputs = model_forward(hidden)
+            outputs = run_transformer(hidden)
         if attention is None:
             return outputs, None
         if require_affinity:

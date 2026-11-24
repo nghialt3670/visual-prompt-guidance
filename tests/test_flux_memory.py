@@ -167,3 +167,109 @@ def test_recomputed_attention_context_supports_higher_order_backward():
     torch.testing.assert_close(out0, out1)
     torch.testing.assert_close(grad0, grad1)
     torch.testing.assert_close(x0.grad, x1.grad, rtol=1e-4, atol=1e-5)
+
+
+def test_per_block_checkpointing_preserves_second_order_head_learning():
+    class SingleAttention(nn.Module):
+        head_dim = 2
+        inner_dim = 4
+
+        def __init__(self):
+            super().__init__()
+            self.to_qkv_mlp_proj = nn.Linear(4, 12)
+            self.norm_q = nn.Identity()
+            self.norm_k = nn.Identity()
+
+        def forward(self, *, hidden_states):
+            q, k, _ = self.to_qkv_mlp_proj(hidden_states).chunk(3, dim=-1)
+            return q.tanh() + .15 * k
+
+    class DoubleBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = SmallAttention()
+
+        def forward(self, hidden_states, encoder_hidden_states):
+            out = hidden_states + .15 * self.attn(
+                hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states,
+            )
+            return encoder_hidden_states, out
+
+    class SingleBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = SingleAttention()
+
+        def forward(self, hidden_states):
+            return hidden_states + .15 * self.attn(hidden_states=hidden_states)
+
+    class PerBlockTransformer(nn.Module):
+        dtype = torch.float32
+
+        def __init__(self):
+            super().__init__()
+            self.transformer_blocks = nn.ModuleList([DoubleBlock()])
+            self.single_transformer_blocks = nn.ModuleList([SingleBlock()])
+            self.gradient_checkpointing = False
+            self._gradient_checkpointing_func = None
+
+        def cache_context(self, _):
+            return nullcontext()
+
+        def forward(self, *, hidden_states, timestep, guidance, encoder_hidden_states,
+                    txt_ids, img_ids, joint_attention_kwargs, return_dict):
+            h, enc = hidden_states, encoder_hidden_states
+            for block in self.transformer_blocks:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    enc, h = self._gradient_checkpointing_func(block, h, enc)
+                else:
+                    enc, h = block(h, enc)
+            h = torch.cat([enc, h], dim=1)
+            for block in self.single_transformer_blocks:
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    h = self._gradient_checkpointing_func(block, h)
+                else:
+                    h = block(h)
+            h = h[:, enc.shape[1]:]
+            return (h + .0001 * timestep.view(-1, 1, 1),)
+
+    def run(checkpointed: bool):
+        torch.manual_seed(23)
+        transformer = PerBlockTransformer().eval().requires_grad_(False)
+        adapter = Flux2Klein()
+        adapter._pipe = SmallPipeline(transformer)
+        adapter.train_checkpoint_transformer = checkpointed
+        adapter.train_checkpoint_attention = checkpointed
+        adapter.train_query_chunk = 1
+        z = torch.randn(1, 2, 4, requires_grad=True)
+        state = _KleinState(
+            latent_data=z, latent_ids=torch.zeros(1, 2, 3),
+            reference=torch.randn(1, 1, 4), reference_ids=torch.zeros(1, 1, 3),
+            prompt_embeds=torch.randn(1, 2, 4), text_ids=torch.zeros(1, 2, 3),
+            negative_embeds=None, negative_ids=None, schedule=torch.tensor([2., 1.]),
+            token_indices=[0], grid=(1, 2), native_size=(32, 16), original_size=(32, 16),
+            cfg=1.0, mode='base', edit_mask=torch.ones(1, 2),
+            source_latents=None, noise=None,
+        )
+        logits = torch.nn.Parameter(torch.tensor([.20, -.15, .05, -.1]))
+        attention = AttentionRequest(layers=('D0', 'S0'), affinity_layers=('D0',), need_affinity=True)
+        predicted = adapter.forward(state, torch.tensor(2.), attention=attention)
+        assert transformer.gradient_checkpointing is False
+        assert transformer._gradient_checkpointing_func is None
+        weights = logits.softmax(dim=0)
+        inner = (predicted.attention.maps * weights.view(1, -1, 1, 1)).sum()
+        inner_grad = torch.autograd.grad(inner, z, create_graph=True)[0]
+        state.latent_data = z - .03 * inner_grad
+        after = adapter.forward(state, torch.tensor(2.), attention=None)
+        state.latent_data = state.latent_data + .07 * after.output
+        final = adapter.forward(state, torch.tensor(1.), attention=None)
+        loss = final.output.square().mean()
+        outer_grad = torch.autograd.grad(loss, logits)[0]
+        assert torch.isfinite(outer_grad).all()
+        return loss.detach(), outer_grad.detach()
+
+    ref_loss, ref_grad = run(False)
+    opt_loss, opt_grad = run(True)
+    torch.testing.assert_close(opt_loss, ref_loss, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(opt_grad, ref_grad, rtol=3e-4, atol=3e-6)
+    assert ref_grad.abs().sum() > 0

@@ -147,13 +147,31 @@ class AttentionCollector:
                     pieces.append(logits.softmax(dim=-1).mean(dim=1))
                 self.self_maps[name] = torch.cat(pieces, dim=1)
 
-    @contextmanager
-    def capture(self, text_len: int, *, capture_self: bool = False):
+    def prepare_capture(self, text_len: int, *, capture_self: bool = False) -> None:
         self.text_len = text_len
         self.maps = {}
         self.head_maps = {}
         self.self_maps = {}
         self._active_self_blocks = self.self_blocks if capture_self else []
+
+    @contextmanager
+    def capture_block(self, name: str):
+        module = self.block_module(self.transformer, name)
+
+        def hook(attn, args, kwargs):
+            if "hidden_states" not in kwargs:
+                raise RuntimeError("Klein attention hook expected keyword hidden_states; update attention.py")
+            self._calculate(name, attn, kwargs)
+
+        handle = module.register_forward_pre_hook(hook, with_kwargs=True)
+        try:
+            yield
+        finally:
+            handle.remove()
+
+    @contextmanager
+    def capture(self, text_len: int, *, capture_self: bool = False):
+        self.prepare_capture(text_len, capture_self=capture_self)
         handles = []
         try:
             for name in dict.fromkeys([*self.blocks, *self._active_self_blocks]):
