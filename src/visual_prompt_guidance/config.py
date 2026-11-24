@@ -35,7 +35,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "train_debug_autograd": False,
     "train_checkpoint_transformer": True, "train_checkpoint_attention": True,
     "train_checkpoint_vae": True, "train_query_chunk": 16,
-    "train_offload_autograd": True,
+    "train_offload_autograd": False,
     "edit_loss_name": "l1", "edit_loss_weight": 1.0,
     "background_loss_name": "l1", "background_loss_weight": 1.0,
     "image_loss_name": "l1", "inside_weight": 1.0, "outside_weight": 1.0,

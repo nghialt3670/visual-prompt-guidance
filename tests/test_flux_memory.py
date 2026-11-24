@@ -110,7 +110,7 @@ def test_memory_options_are_training_only_and_configurable():
     assert settings['train_checkpoint_transformer']
     assert settings['train_checkpoint_attention']
     assert settings['train_checkpoint_vae']
-    assert settings['train_offload_autograd']
+    assert settings['train_offload_autograd'] is False
     assert settings['train_query_chunk'] >= 1
 
 
@@ -127,11 +127,11 @@ def test_runtime_configures_memory_only_for_flux_training():
     assert stub.train_checkpoint_attention is True
     assert stub.train_checkpoint_vae is True
     assert stub.train_query_chunk == 8
-    assert engine.offload_autograd is True
+    assert engine.offload_autograd is False
 
-    settings_no_offload = dict(settings, train_offload_autograd=False)
-    assert build_engine(settings_no_offload, training=True, backend=stub).offload_autograd is False
-    assert build_engine(settings, training=False, backend=stub).offload_autograd is False
+    settings_offload = dict(settings, train_offload_autograd=True)
+    assert build_engine(settings_offload, training=True, backend=stub).offload_autograd is True
+    assert build_engine(settings_offload, training=False, backend=stub).offload_autograd is False
 
 
 def test_invalid_attention_chunk_rejected():

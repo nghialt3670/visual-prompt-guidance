@@ -49,6 +49,9 @@ def make_parser():
     p.add_argument("--no-vae-checkpoint", action="store_false",
                    dest="train_checkpoint_vae", default=None,
                    help="Disable FLUX VAE decoder checkpointing")
+    p.add_argument("--autograd-offload", action="store_true",
+                   dest="train_offload_autograd", default=None,
+                   help="Offload FLUX autograd saved tensors to CPU RAM (needs ample host RAM)")
     p.add_argument("--no-autograd-offload", action="store_false",
                    dest="train_offload_autograd", default=None,
                    help="Disable CPU offloading of FLUX autograd saved tensors")

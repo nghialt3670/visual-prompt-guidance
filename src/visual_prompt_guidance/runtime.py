@@ -192,7 +192,7 @@ def build_engine(settings: Mapping[str, Any], *, training: bool = False,
                   policy=policy, scoring=build_scoring(settings),
                   transform=build_transform(settings), observers=observers,
                   updater=UPDATERS[update_name],
-                  offload_autograd=bool(is_flux_train and settings.get('train_offload_autograd', True)))
+                  offload_autograd=bool(is_flux_train and settings.get('train_offload_autograd', False)))
 
 
 def build_standard_engine(settings: Mapping[str, Any], *, backend=None, observers=()) -> Engine:
