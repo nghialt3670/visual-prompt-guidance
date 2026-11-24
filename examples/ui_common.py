@@ -32,7 +32,7 @@ def serve(demo, *, default_port: int):
     if args.config:
         import os
         os.environ['VPG_CONFIG'] = args.config
-    demo().queue().launch(server_name=args.host, server_port=args.port)
+    demo().queue().launch(server_name=args.host, server_port=args.port, share=True)
 
 
 @lru_cache(maxsize=4)
