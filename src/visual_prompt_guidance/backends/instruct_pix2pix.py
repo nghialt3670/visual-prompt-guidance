@@ -13,6 +13,7 @@ import torch
 from PIL import Image, ImageOps
 
 from ..contracts import AttentionRequest, Prediction, Request, Space, Target
+from ..devices import resolve_device
 from .instruct_pix2pix_attention import UNetAttentionCapture, object_tokens, cross_attention_layers
 
 
@@ -60,11 +61,7 @@ class InstructPix2Pix:
         if self._pipe is not None:
             return self._pipe
         from diffusers import StableDiffusionInstructPix2PixPipeline
-        device = self.device
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else (
-                "mps" if torch.backends.mps.is_available() else "cpu"
-            )
+        device = resolve_device(self.device)
         dtype = ((torch.float16 if device != "cpu" else torch.float32)
                  if self.dtype == "auto" else
                  {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[self.dtype])
@@ -74,7 +71,7 @@ class InstructPix2Pix:
             dtype=dtype,
         )
         if self.cpu_offload:
-            if device != "cuda":
+            if not device.startswith("cuda"):
                 raise ValueError("CPU offload currently requires CUDA")
             pipe.enable_model_cpu_offload(device=device)
         else:

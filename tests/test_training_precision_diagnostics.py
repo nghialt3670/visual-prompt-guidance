@@ -15,6 +15,7 @@ from test_learning import DifferentiableTinyAdapter
 
 
 def test_auto_mps_training_uses_fp32(monkeypatch):
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 0)
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
     monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: True)
     assert resolve_training_precision({'dtype': 'auto', 'device': 'auto'})['dtype'] == 'fp32'
@@ -22,6 +23,13 @@ def test_auto_mps_training_uses_fp32(monkeypatch):
     assert resolve_training_precision({'dtype': 'fp16', 'device': 'mps'})['dtype'] == 'fp16'
     assert resolve_training_precision({'dtype': 'auto', 'device': 'cpu'})['dtype'] == 'auto'
     assert resolve_training_precision({'dtype': 'auto', 'device': 'cuda'})['dtype'] == 'auto'
+    assert resolve_training_precision({'dtype': 'auto', 'device': 'cuda:1'})['dtype'] == 'auto'
+
+
+def test_auto_training_on_cuda_host_keeps_auto_precision(monkeypatch):
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 2)
+    monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: True)
+    assert resolve_training_precision({'dtype': 'auto', 'device': 'auto'})['dtype'] == 'auto'
 
 
 def test_anomaly_mode_part_of_shared_train_settings(tmp_path):

@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 from ..contracts import Request, Space, Target, AttentionBatch, AttentionRequest, Prediction
+from ..devices import resolve_device
 from .flux2_attention import AttentionCollector, find_object_token_indices
 
 
@@ -75,16 +76,14 @@ class Flux2Klein:
 
     def _load(self, mode: str):
         from diffusers import Flux2KleinPipeline, Flux2KleinInpaintPipeline
-        device = self.device
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+        device = resolve_device(self.device)
         dtype = (torch.float32 if device == "cpu" else torch.bfloat16) if self.dtype == "auto" else {
             "fp32": torch.float32, "bf16": torch.bfloat16,
         }[self.dtype]
         cls = Flux2KleinInpaintPipeline if mode == "inpaint" else Flux2KleinPipeline
         pipe=cls.from_pretrained(self.model_id, torch_dtype=dtype)
         if self.cpu_offload:
-            if device != "cuda":
+            if not device.startswith("cuda"):
                 raise ValueError("CPU offload is only supported for CUDA")
             pipe.enable_model_cpu_offload(device=device)
         else:

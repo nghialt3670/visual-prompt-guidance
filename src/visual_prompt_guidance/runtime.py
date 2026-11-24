@@ -31,10 +31,11 @@ def resolve_training_precision(settings: Mapping[str, Any]) -> dict[str, Any]:
     effective = dict(settings)
     if effective.get('dtype', 'auto') != 'auto':
         return effective
-    import torch
+    from .devices import detect_devices
     device = effective.get('device', 'auto')
-    if device == 'mps' or (device == 'auto' and not torch.cuda.is_available()
-                            and torch.backends.mps.is_available()):
+    if device == 'auto':
+        device = detect_devices()[0]
+    if device == 'mps':
         effective['dtype'] = 'fp32'
     return effective
 

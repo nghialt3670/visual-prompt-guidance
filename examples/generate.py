@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from PIL import Image
 from visual_prompt_guidance.config import resolve_settings, save_profile, config_path
+from visual_prompt_guidance.devices import device_choices
 from visual_prompt_guidance.runtime import build_engine, canonical_model, model_options, build_observers
 from visual_prompt_guidance import Point, Box, Scribble, Request
 from visual_prompt_guidance.training import EditingDataset
@@ -23,7 +24,7 @@ def make_parser():
     p.add_argument("--config", default=None)
     p.add_argument("--save-config", action="store_true")
     p.add_argument("--backend", choices=["flux2", "pix2pix"], default=None)
-    p.add_argument("--device", default=None)
+    p.add_argument("--device", default=None, help=f"Device override, one of: {', '.join(device_choices())}")
     p.add_argument("--dtype", default=None)
     p.add_argument("--model-id", default=None)
     p.add_argument("--dataset", default=None, help="Dataset folder / specific manifest / ZIP")

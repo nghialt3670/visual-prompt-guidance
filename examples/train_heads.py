@@ -8,6 +8,7 @@ import argparse
 from pathlib import Path
 
 from visual_prompt_guidance.config import resolve_settings, save_profile, config_path
+from visual_prompt_guidance.devices import device_choices
 from visual_prompt_guidance.runtime import build_engine, canonical_model, model_options, train_config, resolve_training_precision
 from visual_prompt_guidance import HeadTrainer, losses
 from visual_prompt_guidance.experiments import create_run_dir, save_run_config, save_training_reports
@@ -19,7 +20,7 @@ def make_parser():
     p.add_argument("--save-config", action="store_true", help="Persist supplied overrides to the train profile")
     p.add_argument("--backend", choices=["pix2pix", "flux2"], default=None)
     p.add_argument("--dataset", default=None, help="Dataset folder, manifest JSON, or ZIP")
-    p.add_argument("--device", default=None)
+    p.add_argument("--device", default=None, help=f"Device override, one of: {', '.join(device_choices())}")
     p.add_argument("--dtype", default=None)
     p.add_argument("--model-id", default=None)
     p.add_argument("--steps", type=int, default=None)
