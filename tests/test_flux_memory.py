@@ -110,6 +110,7 @@ def test_memory_options_are_training_only_and_configurable():
     assert settings['train_checkpoint_transformer']
     assert settings['train_checkpoint_attention']
     assert settings['train_checkpoint_vae']
+    assert settings['train_offload_autograd']
     assert settings['train_query_chunk'] >= 1
 
 
@@ -126,6 +127,11 @@ def test_runtime_configures_memory_only_for_flux_training():
     assert stub.train_checkpoint_attention is True
     assert stub.train_checkpoint_vae is True
     assert stub.train_query_chunk == 8
+    assert engine.offload_autograd is True
+
+    settings_no_offload = dict(settings, train_offload_autograd=False)
+    assert build_engine(settings_no_offload, training=True, backend=stub).offload_autograd is False
+    assert build_engine(settings, training=False, backend=stub).offload_autograd is False
 
 
 def test_invalid_attention_chunk_rejected():
@@ -273,3 +279,25 @@ def test_per_block_checkpointing_preserves_second_order_head_learning():
     torch.testing.assert_close(opt_loss, ref_loss, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(opt_grad, ref_grad, rtol=3e-4, atol=3e-6)
     assert ref_grad.abs().sum() > 0
+
+
+def test_offload_saved_tensors_preserves_second_order_gradients():
+    from torch.utils.checkpoint import checkpoint
+    from visual_prompt_guidance.engine import _offload_saved_tensors_to_cpu
+
+    def run(offload: bool):
+        torch.manual_seed(9)
+        x = torch.randn(2, 4, requires_grad=True)
+        w = torch.nn.Parameter(torch.randn(4, 4))
+        with _offload_saved_tensors_to_cpu(offload):
+            y = checkpoint(lambda a: (a @ w).tanh(), x, use_reentrant=False)
+            g = torch.autograd.grad(y.square().sum(), x, create_graph=True)[0]
+            z = checkpoint(lambda a: (a @ w).sin(), x - 0.1 * g, use_reentrant=False)
+            loss = z.square().sum()
+        loss.backward()
+        return loss.detach(), w.grad.detach()
+
+    loss0, grad0 = run(False)
+    loss1, grad1 = run(True)
+    torch.testing.assert_close(loss1, loss0)
+    torch.testing.assert_close(grad1, grad0)

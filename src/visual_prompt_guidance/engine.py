@@ -41,6 +41,27 @@ def rms_update(latent: torch.Tensor, gradient: torch.Tensor, cfg: Guidance) -> t
     return updated.to(dtype=latent.dtype), observed_rms
 
 
+def _offload_saved_tensors_to_cpu(enabled: bool):
+    """Move non-parameter autograd saved tensors to host RAM to cap GPU VRAM."""
+    if not enabled:
+        return nullcontext()
+
+    def pack(tensor: torch.Tensor):
+        if tensor.device.type != "cuda" or isinstance(tensor, torch.nn.Parameter) or (
+            not tensor.requires_grad and tensor.is_leaf
+        ):
+            return (None, tensor)
+        return (tensor.device, tensor.to("cpu"))
+
+    def unpack(packed):
+        device, tensor = packed
+        if device is None:
+            return tensor
+        return tensor.to(device)
+
+    return torch.autograd.graph.saved_tensors_hooks(pack, unpack)
+
+
 class Engine:
     """Inject backend, loss object, head policy, optional transform & observers.
 
@@ -56,6 +77,7 @@ class Engine:
         transform: TargetTransform | None = None,
         observers: Sequence[Observer] = (),
         updater: Callable = rms_update,
+        offload_autograd: bool = False,
     ):
         if guidance.strength < 0 or (guidance.max_steps is not None and guidance.max_steps < 0):
             raise ValueError("Invalid guidance settings")
@@ -63,6 +85,7 @@ class Engine:
         self.policy = policy if policy is not None else Uniform()
         self.scoring = scoring if scoring is not None else objective
         self.transform, self.observers, self.updater = transform, tuple(observers), updater
+        self.offload_autograd = offload_autograd
 
     def run(self, request: Request, prompt: VisualPrompt) -> Result:
         """Standard low-memory inference; detaches latent updates and uses no-grad sampling."""
@@ -84,7 +107,8 @@ class Engine:
             raise ValueError("Differentiable training needs at least one guided sampling step")
         # Only the inner guidance gradient requires second-order attention.
         # Native post-guidance denoising uses PyTorch's memory-efficient SDPA.
-        return self._run(request, prompt, differentiable=True)
+        with _offload_saved_tensors_to_cpu(self.offload_autograd):
+            return self._run(request, prompt, differentiable=True)
 
     @staticmethod
     def _guidance_attention_context(differentiable: bool, current: torch.Tensor):

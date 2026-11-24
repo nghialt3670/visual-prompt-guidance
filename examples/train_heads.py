@@ -49,6 +49,9 @@ def make_parser():
     p.add_argument("--no-vae-checkpoint", action="store_false",
                    dest="train_checkpoint_vae", default=None,
                    help="Disable FLUX VAE decoder checkpointing")
+    p.add_argument("--no-autograd-offload", action="store_false",
+                   dest="train_offload_autograd", default=None,
+                   help="Disable CPU offloading of FLUX autograd saved tensors")
     p.add_argument("--attention-query-chunk", type=int, default=None,
                    help="Number of output-image queries per differentiable attention chunk")
     p.add_argument("--weight-decay", type=float, default=None)
@@ -86,6 +89,7 @@ def settings_from_args(args):
         "train_checkpoint_transformer": "train_checkpoint_transformer",
         "train_checkpoint_attention": "train_checkpoint_attention",
         "train_checkpoint_vae": "train_checkpoint_vae",
+        "train_offload_autograd": "train_offload_autograd",
         "attention_query_chunk": "train_query_chunk",
         "edit_loss": "edit_loss_name", "edit_weight": "edit_loss_weight",
         "background_loss": "background_loss_name", "background_weight": "background_loss_weight",

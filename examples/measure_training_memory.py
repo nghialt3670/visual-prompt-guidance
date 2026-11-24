@@ -24,7 +24,8 @@ from visual_prompt_guidance.runtime import (
 
 GIB = 1024 ** 3
 REPORTED_SETTINGS = ("model", "dtype", "steps", "guide_steps", "max_side", "train_query_chunk",
-                     "train_checkpoint_transformer", "train_checkpoint_attention", "train_checkpoint_vae")
+                     "train_checkpoint_transformer", "train_checkpoint_attention", "train_checkpoint_vae",
+                     "train_offload_autograd")
 
 
 class _Stop(Exception):
