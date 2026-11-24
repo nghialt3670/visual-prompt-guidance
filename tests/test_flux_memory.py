@@ -167,3 +167,43 @@ def test_recomputed_attention_context_supports_higher_order_backward():
     torch.testing.assert_close(out0, out1)
     torch.testing.assert_close(grad0, grad1)
     torch.testing.assert_close(x0.grad, x1.grad, rtol=1e-4, atol=1e-5)
+
+
+def test_query_chunked_attention_matches_math_including_second_order():
+    from torch.nn import functional as F
+    from visual_prompt_guidance.backends.flux2 import _fresh_sdpa_context, _query_chunked_attention
+
+    def reference(q, k, v):
+        with _fresh_sdpa_context(True):
+            out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+        return out.transpose(1, 2)
+
+    torch.manual_seed(3)
+    base = [torch.randn(1, 7, 2, 4, dtype=torch.float64) for _ in range(3)]
+
+    def run(fn):
+        q, k, v = [t.clone().requires_grad_(True) for t in base]
+        out = fn(q, k, v)
+        grads = torch.autograd.grad(out.square().sum(), (q, k, v), create_graph=True)
+        sum(g.square().sum() for g in grads).backward()
+        return out.detach(), [g.detach() for g in grads], [t.grad.detach() for t in (q, k, v)]
+
+    expected = run(reference)
+    actual = run(lambda q, k, v: _query_chunked_attention(q, k, v, chunk=3))
+    torch.testing.assert_close(actual[0], expected[0])
+    for got, want in zip(actual[1] + actual[2], expected[1] + expected[2]):
+        torch.testing.assert_close(got, want)
+
+
+def test_query_chunked_self_attention_patch_is_scoped_and_exact():
+    diffusers_flux2 = pytest.importorskip("diffusers.models.transformers.transformer_flux2")
+    from visual_prompt_guidance.backends.flux2 import _query_chunked_self_attention
+
+    original = diffusers_flux2.dispatch_attention_fn
+    q = torch.randn(1, 5, 2, 4, dtype=torch.float64)
+    expected = original(q, q, q)
+    with _query_chunked_self_attention(True, 2):
+        assert diffusers_flux2.dispatch_attention_fn is not original
+        actual = diffusers_flux2.dispatch_attention_fn(q, q, q)
+    assert diffusers_flux2.dispatch_attention_fn is original
+    torch.testing.assert_close(actual, expected)

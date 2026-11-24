@@ -5,7 +5,7 @@ of the framework core. Both base editing and native inpainting are supported.
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
@@ -26,6 +26,51 @@ def _fresh_sdpa_context(math_attention: bool):
         from torch.nn.attention import SDPBackend, sdpa_kernel
         return sdpa_kernel(backends=[SDPBackend.MATH])
     return nullcontext()
+
+
+def _query_chunked_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                             chunk: int) -> torch.Tensor:
+    """Exact MATH-SDPA attention over query chunks, each chunk checkpointed.
+
+    Tensors use the Diffusers layout (batch, tokens, heads, dim). Only one
+    chunk's softmax exists at a time, in forward and in recomputation.
+    """
+    from torch.nn import functional as F
+    from torch.utils.checkpoint import checkpoint
+
+    def attend(q_chunk, k, v):
+        with _fresh_sdpa_context(True):
+            return F.scaled_dot_product_attention(q_chunk, k, v)
+
+    q, k, v = (t.transpose(1, 2) for t in (query, key, value))
+    outputs = [checkpoint(attend, q[:, :, start:start + chunk], k, v, use_reentrant=False)
+               for start in range(0, q.shape[2], chunk)]
+    return torch.cat(outputs, dim=2).transpose(1, 2)
+
+
+@contextmanager
+def _query_chunked_self_attention(enabled: bool, chunk: int):
+    """Route the Diffusers Flux2 attention calls through `_query_chunked_attention`."""
+    if not enabled:
+        yield
+        return
+    from diffusers.models.transformers import transformer_flux2
+    original = transformer_flux2.dispatch_attention_fn
+
+    def dispatch(query, key, value, *args, **kwargs):
+        extra = set(kwargs) - {"attn_mask", "backend", "parallel_config"}
+        if (args or extra or query.shape[1] <= chunk
+                or kwargs.get("attn_mask") is not None
+                or kwargs.get("backend") is not None
+                or kwargs.get("parallel_config") is not None):
+            return original(query, key, value, *args, **kwargs)
+        return _query_chunked_attention(query, key, value, chunk)
+
+    transformer_flux2.dispatch_attention_fn = dispatch
+    try:
+        yield
+    finally:
+        transformer_flux2.dispatch_attention_fn = original
 
 
 @dataclass
@@ -248,7 +293,7 @@ class Flux2Klein:
                 )
             hooks = (collector.capture(text_len=text_len, capture_self=require_affinity)
                      if collector is not None else nullcontext())
-            with _fresh_sdpa_context(math_attention), hooks:
+            with _fresh_sdpa_context(math_attention), _query_chunked_self_attention(math_attention, chunk), hooks:
                 with pipe.transformer.cache_context(cfg_label):
                     pred = pipe.transformer(
                         hidden_states=model_input, timestep=timestep, guidance=None,
