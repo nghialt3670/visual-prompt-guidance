@@ -35,6 +35,7 @@ class Probe:
     def __init__(self):
         self.rows: list[dict] = []
         self.forward_calls = 0
+        self.diagnosed = False
 
     def mark(self, name: str) -> None:
         self.rows.append({
@@ -44,7 +45,19 @@ class Probe:
         })
         torch.cuda.reset_peak_memory_stats()
 
+    def diagnose(self, output) -> None:
+        self.diagnosed = True
+        logits = self.engine.policy.logits
+        print(f"[probe] current device: cuda:{torch.cuda.current_device()} of {torch.cuda.device_count()}", flush=True)
+        print(f"[probe] logits device: {None if logits is None else logits.device}", flush=True)
+        grad_fn = getattr(output, "grad_fn", None)
+        print(f"[probe] output requires_grad={getattr(output, 'requires_grad', None)} "
+              f"grad_fn={type(grad_fn).__name__ if grad_fn is not None else None}", flush=True)
+        for index in range(torch.cuda.device_count()):
+            print(f"[probe] cuda:{index} allocated={torch.cuda.memory_allocated(index) / GIB:.3f} GiB", flush=True)
+
     def attach(self, engine) -> None:
+        self.engine = engine
         backend = engine.backend
 
         original_prepare = backend.prepare
@@ -83,8 +96,10 @@ class _CriterionProbe:
     def __init__(self, inner, probe: Probe):
         self.inner, self.probe = inner, probe
 
-    def __call__(self, *args, **kwargs):
-        out = self.inner(*args, **kwargs)
+    def __call__(self, output, *args, **kwargs):
+        if not self.probe.diagnosed:
+            self.probe.diagnose(output)
+        out = self.inner(output, *args, **kwargs)
         self.probe.mark("image loss")
         return out
 
