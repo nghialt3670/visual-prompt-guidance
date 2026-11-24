@@ -81,6 +81,15 @@ class Probe:
 
         backend.forward = forward
 
+        original_updater = engine.updater
+
+        def updater(*args, **kwargs):
+            # updater runs immediately after torch.autograd.grad(..., create_graph=True)
+            self.mark(f"guided inner backward #{self.forward_calls}")
+            return original_updater(*args, **kwargs)
+
+        engine.updater = updater
+
         if hasattr(backend, "decode_tensor"):
             original_decode = backend.decode_tensor
 
