@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw
 from visual_prompt_guidance import losses
 from visual_prompt_guidance.config import config_path, profile_settings, save_profile, normalize_value
 from visual_prompt_guidance.runtime import build_backend
-from visual_prompt_guidance.devices import device_choices
+from visual_prompt_guidance.devices import device_dropdown_choices
 from visual_prompt_guidance.backends.attention_catalog import labels_from_catalog
 from visual_prompt_guidance.prompts import Point, Box, Scribble
 
@@ -399,7 +399,9 @@ class Panel:
                 add('model', gr.Dropdown(['InstructPix2Pix', 'FLUX.2 Klein'], value=init['model'], label='Model'))
                 add('model_id', gr.Textbox(value=init['model_id'] or '', label='Model ID / local path', placeholder='Default checkpoint'))
             with gr.Row():
-                device_options = list(dict.fromkeys([*device_choices(), init['device']]))
+                device_options = device_dropdown_choices()
+                if init['device'] not in {value for _, value in device_options}:
+                    device_options.append((init['device'], init['device']))
                 add('device', gr.Dropdown(device_options, value=init['device'], label='Device'))
                 add('dtype', gr.Dropdown(['auto', 'fp32', 'fp16', 'bf16'], value=init['dtype'], label='Dtype'))
             flux = gr.Group(visible=init['model'] == 'FLUX.2 Klein')

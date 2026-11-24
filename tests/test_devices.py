@@ -7,11 +7,16 @@ import torch
 
 from visual_prompt_guidance.backends.flux2 import Flux2Klein
 from visual_prompt_guidance.backends.instruct_pix2pix import InstructPix2Pix
-from visual_prompt_guidance.devices import detect_devices, device_choices, resolve_device
+from visual_prompt_guidance.devices import detect_devices, device_choices, device_dropdown_choices, resolve_device
+
+GIB = 2**30
 
 
-def _host(monkeypatch, gpus, mps):
+def _host(monkeypatch, gpus, mps, free=None):
+    free = free or [16 * GIB] * gpus
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: gpus)
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda index: (free[index], 16 * GIB))
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda index: f'GPU{index}')
     monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: mps)
 
 
@@ -25,6 +30,36 @@ def test_auto_and_legacy_cuda_map_to_first_gpu(monkeypatch):
     _host(monkeypatch, gpus=2, mps=False)
     assert resolve_device('auto') == 'cuda:0'
     assert resolve_device('cuda') == 'cuda:0'
+
+
+def test_auto_picks_gpu_with_most_free_memory(monkeypatch):
+    _host(monkeypatch, gpus=3, mps=False, free=[1 * GIB, 20 * GIB, 5 * GIB])
+    assert resolve_device('auto') == 'cuda:1'
+
+
+def test_auto_ties_go_to_lowest_gpu_index(monkeypatch):
+    _host(monkeypatch, gpus=2, mps=False, free=[5 * GIB, 5 * GIB])
+    assert resolve_device('auto') == 'cuda:0'
+
+
+def test_dropdown_labels_show_gpu_name_and_free_memory(monkeypatch):
+    _host(monkeypatch, gpus=2, mps=False, free=[2 * GIB, 23 * GIB])
+    assert device_dropdown_choices() == [
+        ('auto', 'auto'),
+        ('cuda:0 (GPU0, 2.0 GiB free)', 'cuda:0'),
+        ('cuda:1 (GPU1, 23.0 GiB free)', 'cuda:1'),
+        ('cpu', 'cpu'),
+    ]
+
+
+def test_dropdown_label_survives_memory_query_failure(monkeypatch):
+    _host(monkeypatch, gpus=1, mps=False)
+
+    def broken(index):
+        raise RuntimeError('driver too old')
+
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', broken)
+    assert device_dropdown_choices()[1] == ('cuda:0 (GPU0)', 'cuda:0')
 
 
 def test_explicit_gpu_index_is_kept(monkeypatch):
